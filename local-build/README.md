@@ -50,7 +50,9 @@ in `/Applications` is the one thing they share.
      readable only by `loopbuilder`,
    - installs the weekly schedule, which runs as `loopbuilder`.
 3. It then offers to continue as `loopbuilder` (or later:
-   `sudo -iu loopbuilder ~/loop-build-src/local-build/install.sh`). That part runs
+   `sudo -iu loopbuilder /Users/loopbuilder/loop-build-src/local-build/install.sh`;
+   write the full path, because your own shell would expand a `~` to your home and
+   run your copy instead of `loopbuilder`'s). That part runs
    inside `loopbuilder`'s home, with no `sudo`: it builds a private Ruby, asks for
    your Apple details, writes the settings, sets up the certificate backup, runs
    `setup` and starts the first build in the background.

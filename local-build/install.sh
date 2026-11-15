@@ -11,8 +11,9 @@
 #       loopbuilder's home, hands over the API key file, and installs the weekly
 #       schedule. Installs nothing in your account. Then it offers to continue as
 #       loopbuilder, which runs:
-#   sudo -iu loopbuilder ~/loop-build-src/local-build/install.sh
-#       Everything else, inside loopbuilder's home.
+#   sudo -iu loopbuilder /Users/loopbuilder/loop-build-src/local-build/install.sh
+#       Everything else, inside loopbuilder's home. Use the full path: a "~" would
+#       be expanded by your own shell and run your copy instead of loopbuilder's.
 #
 # With a single account, just run it as that account, without --admin.
 #
@@ -31,6 +32,17 @@
 # Written for the bash 3.2 that ships with macOS.
 
 set -euo pipefail
+
+# Use this account's own home even if HOME says otherwise: macOS's sudo keeps the
+# caller's HOME unless -i is used, so "sudo -u loopbuilder ..." would otherwise
+# put loopbuilder's files in the caller's home.
+_real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+[ -n "$_real_home" ] || _real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+if [ -n "$_real_home" ] && [ "$_real_home" != "${HOME:-}" ]; then
+  echo "Note: HOME was ${HOME:-unset}; using $(id -un)'s home, $_real_home." >&2
+  HOME="$_real_home"
+  export HOME
+fi
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"          # local-build/ in your clone of the fork
 TOOLS_DIR="$(cd "$HERE/.." && pwd -P)"           # the clone itself
@@ -96,6 +108,8 @@ run_sudo() {
 then run this script again."
 }
 pause() { printf '   %s Press Return when done. ' "$*"; IFS= read -r _ || true; }
+
+file_owner() { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1"; }
 
 version_ge() { # version_ge 3.3.6 3.0
   local IFS=.
@@ -374,6 +388,21 @@ case "${1:-}" in
   -h|--help) sed -n '2,/^# Written for/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) die "Unknown option: $1 (see install.sh --help)" ;;
 esac
+
+# This account's settings will point at the clone this script runs from, so it
+# has to be this account's own clone, not someone else's.
+if [ "$(file_owner "$HERE/install.sh")" != "$(id -u)" ]; then
+  own="$HOME/loop-build-src/local-build/install.sh"
+  if [ -f "$own" ]; then
+    die "This copy of install.sh belongs to another account ($HERE).
+Run $(whoami)'s own copy instead:
+    $own
+(From your admin account: sudo -iu $(whoami) $own )"
+  fi
+  die "This copy of install.sh belongs to another account ($HERE), and $(whoami) has no
+copy of the fork yet. From your admin account, run its own copy with:
+    ~/loop-build-src/local-build/install.sh --admin $(whoami)"
+fi
 
 if [ "$CAN_ADMIN" = 1 ]; then
   echo "$(whoami) is an administrator account. Builds can run here, or in a separate"

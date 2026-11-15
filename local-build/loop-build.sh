@@ -40,6 +40,17 @@
 
 set -euo pipefail
 
+# Use this account's own home even if HOME says otherwise: macOS's sudo keeps the
+# caller's HOME unless -i is used, so "sudo -u loopbuilder ..." would otherwise
+# put loopbuilder's files in the caller's home.
+_real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+[ -n "$_real_home" ] || _real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+if [ -n "$_real_home" ] && [ "$_real_home" != "${HOME:-}" ]; then
+  echo "Note: HOME was ${HOME:-unset}; using $(id -un)'s home, $_real_home." >&2
+  HOME="$_real_home"
+  export HOME
+fi
+
 BASE="${LOOP_BUILD_HOME:-$HOME/loop-build}"
 CONFIG="${LOOP_BUILD_CONFIG:-$HOME/.config/loop-build/config}"
 SRC="$BASE/LoopWorkspace"
