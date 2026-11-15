@@ -1,0 +1,54 @@
+diff --git a/MockKit/MockPumpManager.swift b/MockKit/MockPumpManager.swift
+index ddd4d478..41539d34 100644
+--- a/MockKit/MockPumpManager.swift
++++ b/MockKit/MockPumpManager.swift
+@@ -536,8 +536,48 @@ public final class MockPumpManager: TestingPumpManager {
+         }
+     }
+ 
++    // MARK: - Simulated BLE heartbeat
++    //
++    // Real pumps (RileyLink, Omnipod DASH) provide a periodic BLE "heartbeat" that wakes Loop so it can
++    // poll CGMs that can't wake the app themselves (e.g. Dexcom Share, Nightscout). Simulate that here so
++    // network CGMs keep updating when paired with the simulator pump.
++
++    public static let heartbeatInterval: TimeInterval = .minutes(1)
++
++    private let heartbeatQueue = DispatchQueue(label: "com.loopkit.MockPumpManager.heartbeat")
++    private var heartbeatTimer: DispatchSourceTimer?
++
+     public func setMustProvideBLEHeartbeat(_ mustProvideBLEHeartbeat: Bool) {
+-        // nothing to do here
++        heartbeatQueue.async { [weak self] in
++            guard let self else { return }
++
++            guard mustProvideBLEHeartbeat else {
++                self.heartbeatTimer?.cancel()
++                self.heartbeatTimer = nil
++                return
++            }
++
++            // Loop re-sends the request after every CGM reading; keep the existing timer running.
++            guard self.heartbeatTimer == nil else { return }
++
++            let timer = DispatchSource.makeTimerSource(queue: self.heartbeatQueue)
++            timer.schedule(deadline: .now() + Self.heartbeatInterval,
++                           repeating: Self.heartbeatInterval,
++                           leeway: .seconds(5))
++            timer.setEventHandler { [weak self] in
++                guard let self else { return }
++                self.logDeviceCommunication("Simulated BLE heartbeat", type: .receive)
++                self.delegate.notify { delegate in
++                    delegate?.pumpManagerBLEHeartbeatDidFire(self)
++                }
++            }
++            self.heartbeatTimer = timer
++            timer.resume()
++        }
++    }
++
++    deinit {
++        heartbeatTimer?.cancel()
+     }
+     
+     private func stopInsulinDelivery() {
