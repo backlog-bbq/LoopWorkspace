@@ -15,13 +15,44 @@ ones the GitHub "Browser Build" uses) without GitHub Actions:
 
 | File | What it is |
 | --- | --- |
+| `install.sh` | Sets up the Mac step by step and starts the first build. Start here. |
 | `loop-build.sh` | The build script. `loop-build.sh help` lists its commands. |
 | `loop-build.conf.example` | Settings template for `~/.config/loop-build/config`. |
 | `com.loopbuild.auto.plist` | Runs `loop-build.sh auto` every Sunday at 3:17 AM. |
 | `patches/` | Changes applied to LoopKit's code before each build. |
 | `com.github.actions-runner.loop.plist` | Only for the self-hosted runner option at the end. |
 
+## Quick start
+
+Over ssh on the Mac mini, as the user that will run the builds:
+
+```sh
+git clone --single-branch -b claude/loop-headless-mac-dexcom-share-s4f8jv \
+  https://github.com/backlog-bbq/LoopWorkspace.git ~/loop-build-src
+~/loop-build-src/local-build/install.sh
+```
+
+`install.sh` does every step below for you and asks only for what it can't find out
+itself: your Team ID, the App Store Connect API key, and the backup repo on your git
+server. It installs Ruby (and Homebrew if needed), gets the right Xcode ready,
+writes the settings file, runs `setup`, installs the weekly schedule and starts the
+first build in the background. It asks for your password when a step needs `sudo`.
+
+Have these ready before you start:
+
+- Your **Team ID** (developer.apple.com > Account > Membership details).
+- An **App Store Connect API key** with Admin access, its Key ID and Issuer ID
+  (step 4 below), with the `.p8` file copied to the Mac, for example into
+  `~/Downloads` or `~/.config/loop-build`. `install.sh` finds it there.
+- An **empty, private repo** on your git server for the certificate backup.
+
+If anything fails, fix it and run `install.sh` again: it skips what's already done
+and offers your earlier answers as defaults.
+
 ## First build, step by step
+
+These are the steps `install.sh` performs, if you'd rather do them by hand or need
+to see what one of them does.
 
 Do everything over ssh on the Mac mini, as the user that will run the builds. Your
 own account is fine. (A separate non-admin user is safer; if you make one, do every

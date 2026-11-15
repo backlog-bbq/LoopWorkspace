@@ -11,6 +11,8 @@
 #   * Apple is reached with an App Store Connect API key, so no Apple ID has
 #     to be signed in to Xcode. Works over ssh and from launchd.
 #
+# First time on a new Mac: run install.sh (next to this script); it does all the setup.
+#
 # Commands:
 #   check                       List what still needs doing before setup/build.
 #   setup [--import-match URL]  One-time: create the local match repo (or copy an
@@ -256,12 +258,25 @@ state_key() {
   echo "$head-$patches"
 }
 
+xcode_version() { # xcode_version /Applications/Xcode.app -> 27.1
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null \
+    || "$1/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | awk 'NR==1 {print $2}'
+}
+
 select_xcode() {
-  local app="$XCODE_APP"
+  local app="$XCODE_APP" want wantv havev
+  want="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$SRC/.github/workflows/build_loop.yml" 2>/dev/null | head -n 1 || true)"
   if [ -z "$app" ]; then
-    app="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$SRC/.github/workflows/build_loop.yml" 2>/dev/null | head -n 1 || true)"
+    app="$want"
     [ -n "$app" ] || die "Couldn't read which Xcode LoopKit uses. Set XCODE_APP in the config."
     log "LoopKit currently builds with $app"
+  elif [ -n "$want" ] && [ -d "$app" ]; then
+    wantv="$(printf '%s' "$want" | sed -E 's#.*/Xcode_?([0-9.]*)\.app#\1#')"
+    havev="$(xcode_version "$app" || true)"
+    case "$havev" in
+      "$wantv"|"$wantv".*|"") ;;
+      *) log "WARNING: LoopKit now builds with Xcode $wantv, but XCODE_APP is Xcode $havev ($app). If the build fails, install Xcode $wantv (run install.sh again) or update XCODE_APP." ;;
+    esac
   fi
   [ -d "$app/Contents/Developer" ] || die "Xcode not found at $app. Install that version at that path (for example with 'xcodes'), or set XCODE_APP in the config."
   export DEVELOPER_DIR="$app/Contents/Developer"
@@ -406,6 +421,7 @@ cmd_setup() {
   run_lane identifiers
   ensure_certs
   backup_match || die "Certificates are ready, but the backup to MATCH_BACKUP_URL failed. Fix the URL or its access, then run '$0 backup'."
+  date +%s > "$STATE_DIR/setup_complete"
   log "Setup complete. Make the first build with: $0 build"
 }
 
@@ -533,7 +549,7 @@ cmd_check() {
     todo "Xcode not found at $app. Install that version there, or set XCODE_APP in the config to the Xcode you have (ls -d /Applications/Xcode*.app)."
   else
     xb="$app/Contents/Developer/usr/bin/xcodebuild"
-    ok "$app ($("$xb" -version 2>/dev/null | head -n 1))"
+    ok "$app (Xcode $(xcode_version "$app" || true))"
     if "$xb" -license check >/dev/null 2>&1; then ok "license accepted"
     else todo "Accept the Xcode license: sudo \"$xb\" -license accept"; fi
     if "$xb" -checkFirstLaunchStatus >/dev/null 2>&1; then ok "first-launch setup done"
@@ -560,7 +576,8 @@ cmd_check() {
   fi
 
   echo "Certificates"
-  if [ -d "$MATCH_REPO" ]; then ok "certificate repo exists ($MATCH_REPO)"
+  if [ -f "$STATE_DIR/setup_complete" ]; then ok "setup done; certificate repo at $MATCH_REPO"
+  elif [ -d "$MATCH_REPO" ]; then note "setup didn't finish last time; run it again."
   else note "No certificate repo yet; 'setup' creates it."; fi
   if [ -z "$MATCH_BACKUP_URL" ]; then
     note "MATCH_BACKUP_URL isn't set; nothing backs up your certificate repo."
@@ -575,7 +592,7 @@ cmd_check() {
     echo "$problems thing(s) to do before building."
     return 1
   fi
-  if [ -d "$MATCH_REPO" ]; then
+  if [ -f "$STATE_DIR/setup_complete" ]; then
     echo "Ready. Build and upload with: $0 build"
   else
     echo "Ready for setup. Run: $0 setup"
