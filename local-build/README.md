@@ -24,35 +24,60 @@ ones the GitHub "Browser Build" uses) without GitHub Actions:
 
 ## Quick start
 
-Over ssh on the Mac mini, as the user that will run the builds:
+Builds run in a separate **Standard** (non-admin) account, here called `loopbuilder`;
+your own account stays the administrator. Only the build account gets Ruby, fastlane,
+the settings, the signing keys and the builds. Your account needs none of it; Xcode
+in `/Applications` is the one thing they share.
 
-```sh
-git clone --single-branch -b claude/loop-headless-mac-dexcom-share-s4f8jv \
-  https://github.com/backlog-bbq/LoopWorkspace.git ~/loop-build-src
-~/loop-build-src/local-build/install.sh
-```
+1. Create the build account, if you haven't: System Settings > Users & Groups >
+   Add User, type **Standard**, name `loopbuilder`. Or over ssh:
+   `sudo sysadminctl -addUser loopbuilder -fullName "Loop Builder" -password '<password>'`.
+   Nobody needs to log in to it at the screen.
+2. Over ssh, in **your own** account:
 
-`install.sh` does every step below for you and asks only for what it can't find out
-itself: your Team ID, the App Store Connect API key, and the backup repo on your git
-server. It gets the right Xcode ready, builds a private Ruby, writes the settings
-file, runs `setup`, installs the weekly schedule and starts the first build in the
-background.
+   ```sh
+   git clone --single-branch -b claude/loop-headless-mac-dexcom-share-s4f8jv \
+     https://github.com/backlog-bbq/LoopWorkspace.git ~/loop-build-src
+   ~/loop-build-src/local-build/install.sh --admin loopbuilder
+   ```
+
+   This does only what needs an administrator, and installs nothing in your account:
+   - gets the shared Xcode in `/Applications` ready (license, first-launch setup,
+     iOS and watchOS platforms; it offers to download Xcode if the right version is
+     missing),
+   - clones the fork into `loopbuilder`'s home,
+   - moves the API key from your `~/Downloads` into `loopbuilder`'s settings folder,
+     readable only by `loopbuilder`,
+   - installs the weekly schedule, which runs as `loopbuilder`.
+3. It then offers to continue as `loopbuilder` (or later:
+   `sudo -iu loopbuilder ~/loop-build-src/local-build/install.sh`). That part runs
+   inside `loopbuilder`'s home, with no `sudo`: it builds a private Ruby, asks for
+   your Apple details, writes the settings, sets up the certificate backup, runs
+   `setup` and starts the first build in the background.
+
+Without `--admin`, an administrator account is asked whether to build there or to
+set up a separate build account. To build in a single account, answer yes.
+
+If the first build started from `sudo -iu` fails with a signing or keychain error,
+start it from your account the way the weekly run starts it:
+`sudo launchctl kickstart system/com.loopbuild.auto`.
 
 ### What it installs, and where
 
-Everything goes in your home folder; Homebrew isn't used or needed.
+Everything except Xcode goes in the build account's home folder. Homebrew isn't used or needed.
 
 | What | Where |
 | --- | --- |
-| Ruby 3.4 with its own OpenSSL and libyaml, built from source by `ruby-build` (10-20 min, once) | `~/loop-build/ruby` |
-| `ruby-build`, and `xcodes` if it has to download Xcode | `~/loop-build/tools` |
+| Ruby 3.4 with its own OpenSSL and libyaml, built from source by `ruby-build` (10-20 min, once) | `~/loop-build/ruby` (the build account's home, like everything below except Xcode) |
+| `ruby-build` (and `xcodes`, if a single account downloads Xcode with it) | `~/loop-build/tools` |
 | fastlane and the other gems | `~/loop-build/bundle` |
 | LoopWorkspace, logs, build output, certificate repo | `~/loop-build` |
 | Settings and API key | `~/.config/loop-build` |
-| Xcode, only if you don't already have the right version | `~/Applications` |
+| Xcode, only if you don't already have the right version | `/Applications` (shared; `~/Applications` for a single account) |
 | Backup deploy key | `~/.ssh/loop_match_backup` |
 
-It uses `sudo` only for these, and asks for your password each time:
+`sudo` is used only in the `--admin` part (or by a single administrator account),
+for these:
 
 - Accepting the Xcode license and Xcode's first-launch setup, which Xcode needs before
   it can build anything. If you've already opened that Xcode, both are done and skipped.
@@ -67,8 +92,8 @@ Have these ready before you start:
 
 - Your **Team ID** (developer.apple.com > Account > Membership details).
 - An **App Store Connect API key** with Admin access, its Key ID and Issuer ID
-  (step 4 below), with the `.p8` file copied to the Mac, for example into
-  `~/Downloads` or `~/.config/loop-build`. `install.sh` finds it there.
+  (step 4 below), with the `.p8` file copied into your `~/Downloads` on the Mac.
+  `install.sh --admin` hands it to the build account.
 - An **empty, private repo** on your git server for the certificate backup.
 
 If anything fails, fix it and run `install.sh` again: it skips what's already done
@@ -81,9 +106,8 @@ to see what one of them does.
 
 Do everything over ssh on the Mac mini, as the user that will run the builds. Your
 own account is fine. (A separate non-admin user is safer; if you make one, do every
-step as that user. The `sudo` steps then need an admin: run `install.sh` as that
-user, and when it stops at a `sudo` step, run the command it shows from an admin
-account, then run `install.sh` again.)
+step as that user. The `sudo` steps then need an admin: do them from your own
+account, or let `install.sh --admin <build-account>` do them.)
 
 ### 1. Check the clone and link the script
 

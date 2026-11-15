@@ -1,9 +1,20 @@
 #!/bin/bash
 #
 # install.sh - set up this Mac to build Loop with loop-build.sh, then start the
-# first build. Run it over ssh, as the user that will run the builds:
+# first build.
 #
-#   ~/loop-build-src/local-build/install.sh
+# With a separate Standard account for builds (recommended), run it twice:
+#
+#   ~/loop-build-src/local-build/install.sh --admin loopbuilder
+#       From your own (administrator) account. Does only what needs an admin:
+#       gets the shared Xcode in /Applications ready, clones the fork into
+#       loopbuilder's home, hands over the API key file, and installs the weekly
+#       schedule. Installs nothing in your account. Then it offers to continue as
+#       loopbuilder, which runs:
+#   sudo -iu loopbuilder ~/loop-build-src/local-build/install.sh
+#       Everything else, inside loopbuilder's home.
+#
+# With a single account, just run it as that account, without --admin.
 #
 # It walks through every step in README.md: links the script, gets Xcode ready,
 # builds a private Ruby, asks for your Apple details, writes the settings file,
@@ -37,6 +48,7 @@ TOOLS="$BASE/tools"                              # ruby-build and xcodes live he
 LIBYAML_URL="https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz#c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4"
 XCODES_URL="https://github.com/XcodesOrg/xcodes/releases/latest/download/xcodes.zip"
 MIN_RUBY=3.2                                     # Bundler 4, which LoopKit's Gemfile.lock pins, needs 3.2
+XCODE_APP=""                                     # set by xcode_step (or from the settings file)
 
 STEP=0
 step() { STEP=$((STEP + 1)); printf '\n\033[1m%s. %s\033[0m\n' "$STEP" "$*"; }
@@ -70,8 +82,11 @@ yesno() {
     case "${ans:-$2}" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; esac
   done
 }
-# Run a command with sudo. If this user can't use sudo (a non-admin account), say
-# exactly what an admin needs to run, so it can be done from another account.
+can_admin() { id -Gn 2>/dev/null | tr ' ' '\n' | grep -qx admin; }
+admin_hint() {
+  printf 'This needs your administrator account. From it, run (in your clone of the fork):\n    ~/loop-build-src/local-build/install.sh --admin %s\nthen run this again as %s.' "$(whoami)" "$(whoami)"
+}
+# Run a command with sudo; if that fails, say exactly what an admin needs to run.
 run_sudo() {
   if sudo "$@"; then return 0; fi
   local q="" a
@@ -125,6 +140,212 @@ backup_git() {
   GIT_SSH_COMMAND="$ssh_cmd" GIT_TERMINAL_PROMPT=0 git "$@"
 }
 
+
+# Download the xcodes command-line tool into $TOOLS (no Homebrew).
+get_xcodes() {
+  [ -x "$TOOLS/xcodes" ] && return 0
+  mkdir -p "$TOOLS"
+  info "Downloading the xcodes tool into $TOOLS..."
+  local zip="$TOOLS/xcodes.zip"
+  if curl -fsSL -o "$zip" "$XCODES_URL" && unzip -oq "$zip" -d "$TOOLS" && [ -x "$TOOLS/xcodes" ]; then
+    rm -f "$zip"
+    return 0
+  fi
+  rm -f "$zip"
+  warn "Couldn't download xcodes from $XCODES_URL."
+  return 1
+}
+
+# xcode_step DOWNLOAD_DIR [OTHER_HOME]
+# Find the Xcode LoopKit builds with (in /Applications, ~/Applications and
+# OTHER_HOME/Applications), download it into DOWNLOAD_DIR if missing, and make
+# sure its license, first-launch setup and iOS/watchOS platforms are done.
+# Sets XCODE_APP. A Standard account can't do the admin parts; it's told how.
+xcode_step() {
+  local dl_dir="$1" other_home="${2:-}" want_app want chosen="" choice="" found match x sdks plat sdk
+  want_app="$(curl -fsSL --max-time 20 "$UPSTREAM_WORKFLOW" 2>/dev/null | grep -oE '/Applications/Xcode[^/"]*\.app' | head -n 1 || true)"
+  [ -n "$want_app" ] || want_app="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$TOOLS_DIR/.github/workflows/build_loop.yml" 2>/dev/null | head -n 1 || true)"
+  want="$(printf '%s' "$want_app" | sed -E 's#.*/Xcode_?([0-9.]*)\.app#\1#')"
+  [ -n "$want" ] || die "Couldn't tell which Xcode LoopKit builds with. Check your network and run this again."
+  info "LoopKit builds with Xcode $want."
+
+  matches_want() { case "$1" in "$want"|"$want".*) return 0 ;; *) return 1 ;; esac; }
+  list_xcodes() { # prints "path|version" for each Xcode found
+    for x in /Applications/Xcode*.app "$HOME"/Applications/Xcode*.app ${other_home:+"$other_home"/Applications/Xcode*.app}; do
+      [ -d "$x/Contents/Developer" ] || continue
+      printf '%s|%s\n' "$x" "$(xcode_version "$x" || true)"
+    done | awk '!seen[$0]++'
+  }
+
+  if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP/Contents/Developer" ] && matches_want "$(xcode_version "$XCODE_APP" || true)"; then
+    chosen="$XCODE_APP"
+  fi
+  while [ -z "$chosen" ]; do
+    found="$(list_xcodes)"
+    match="$(printf '%s\n' "$found" | while IFS='|' read -r p v; do if [ -n "$p" ] && matches_want "$v"; then echo "$p"; break; fi; done)"
+    if [ -n "$match" ]; then chosen="$match"; break; fi
+    [ "$CAN_ADMIN" = 1 ] || die "Xcode $want isn't installed. $(admin_hint)"
+
+    if [ -n "$found" ]; then
+      info "None of the installed Xcodes is $want:"
+      printf '%s\n' "$found" | awk -F'|' '{ printf "     %d) %s (Xcode %s)\n", NR, $1, $2 }'
+    else
+      info "No Xcode found."
+    fi
+    info "Options: i) download Xcode $want into $dl_dir with the 'xcodes' tool (asks for your Apple ID)"
+    [ -n "$found" ] && info "         <number>) use one of the above anyway (the build may fail)"
+    info "         r) I installed it another way; look again"
+    ask choice "Choice" i
+    case "$choice" in
+      i|I)
+        if get_xcodes; then
+          mkdir -p "$dl_dir"
+          "$TOOLS/xcodes" install "$want" --directory "$dl_dir" || warn "xcodes didn't finish."
+        fi
+        info "You can also download Xcode $want from developer.apple.com/download/all,"
+        info "unpack it into $dl_dir and choose r."
+        ;;
+      r|R) ;;
+      *[!0-9]*|"") warn "Not a choice." ;;
+      *)
+        chosen="$(printf '%s\n' "$found" | sed -n "${choice}p" | cut -d'|' -f1)"
+        [ -n "$chosen" ] || warn "Not a choice."
+        ;;
+    esac
+  done
+  XCODE_APP="$chosen"
+  XB="$XCODE_APP/Contents/Developer/usr/bin/xcodebuild"
+  ok "Using $XCODE_APP (Xcode $(xcode_version "$XCODE_APP" || true))"
+
+  # License and first launch are system-wide: once done, every account has them.
+  if "$XB" -license check >/dev/null 2>&1; then
+    ok "License accepted"
+  else
+    [ "$CAN_ADMIN" = 1 ] || die "The Xcode license hasn't been accepted. $(admin_hint)"
+    info "Accepting the Xcode license (needs your password)..."
+    run_sudo "$XB" -license accept
+  fi
+  if "$XB" -checkFirstLaunchStatus >/dev/null 2>&1; then
+    ok "First-launch setup done"
+  else
+    [ "$CAN_ADMIN" = 1 ] || die "Xcode's first-launch setup hasn't run. $(admin_hint)"
+    info "Running Xcode's first-launch setup (needs your password)..."
+    run_sudo "$XB" -runFirstLaunch
+  fi
+  sdks="$("$XB" -showsdks 2>/dev/null || true)"
+  for plat in iOS watchOS; do
+    case "$plat" in iOS) sdk=iphoneos ;; *) sdk=watchos ;; esac   # names in -showsdks output
+    if printf '%s' "$sdks" | grep -q -- "-sdk $sdk"; then
+      ok "$plat platform installed"
+    else
+      info "Downloading the $plat platform (several GB; this takes a while)..."
+      if ! "$XB" -downloadPlatform "$plat"; then
+        [ "$CAN_ADMIN" = 1 ] && die "Downloading the $plat platform failed."
+        die "Downloading the $plat platform failed. $(admin_hint)"
+      fi
+    fi
+  done
+}
+
+# install_schedule USER HOME: the LaunchDaemon that runs 'loop-build.sh auto'
+# weekly as USER. Needs an admin; a Standard account is told how.
+install_schedule() {
+  local u="$1" h="$2" tmp current
+  tmp="$(mktemp)"
+  sed -e "s#/Users/loopbuilder#$h#g" -e "s#loopbuilder#$u#g" "$HERE/$PLIST_NAME.plist" > "$tmp"
+  if [ -f "$PLIST_DEST" ] && cmp -s "$tmp" "$PLIST_DEST"; then
+    ok "Already installed: every Sunday at 3:17 AM as $u."
+    rm -f "$tmp"
+    return 0
+  fi
+  info "Builds automatically every Sunday at 3:17 AM, as $u, when LoopKit or the"
+  info "patches change, and at least every 30 days. It runs while nobody is logged in,"
+  info "which needs one system file: $PLIST_DEST"
+  if [ "$CAN_ADMIN" != 1 ]; then
+    info "$(admin_hint)"
+    info "(Or build by hand with: $LB build)"
+    rm -f "$tmp"
+    return 0
+  fi
+  if [ -f "$PLIST_DEST" ]; then
+    current="$(grep -A1 '<key>UserName</key>' "$PLIST_DEST" | sed -n 's#.*<string>\(.*\)</string>.*#\1#p')"
+    [ "$current" = "$u" ] || warn "It replaces the current schedule, which builds as ${current:-another user}."
+  fi
+  if yesno "Install the weekly schedule?" y; then
+    sudo launchctl bootout "system/$PLIST_NAME" >/dev/null 2>&1 || true
+    run_sudo install -o root -g wheel -m 644 "$tmp" "$PLIST_DEST"
+    run_sudo launchctl bootstrap system "$PLIST_DEST"
+    ok "Installed."
+  else
+    info "Skipped. Build by hand with: $LB build"
+  fi
+  rm -f "$tmp"
+}
+
+# The administrator's part of a two-account setup. Installs nothing in this account.
+admin_mode() {
+  local u="$1" uhome ugroup src url branch key
+  can_admin || die "--admin has to run from an administrator account."
+  [ "$u" != "$(whoami)" ] || die "That's this account. To build as yourself, run install.sh without --admin."
+  id "$u" >/dev/null 2>&1 || die "There's no account named '$u'. Create a Standard account in System Settings >
+Users & Groups (or: sudo sysadminctl -addUser $u -fullName 'Loop Builder' -password '<password>'),
+then run this again."
+  if id -Gn "$u" | tr ' ' '\n' | grep -qx admin; then
+    warn "$u is an administrator. A Standard account is safer for builds."
+  fi
+  uhome="$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+  [ -n "$uhome" ] || uhome="$(getent passwd "$u" 2>/dev/null | cut -d: -f6 || true)"
+  if [ -z "$uhome" ] || ! sudo test -d "$uhome"; then
+    die "$u has no home folder yet. Run: sudo createhomedir -c -u $u   then run this again."
+  fi
+  ugroup="$(id -gn "$u")"
+  TOOLS="$(mktemp -d)"   # only for a downloaded xcodes; nothing goes in this account
+  LB="$uhome/loop-build/loop-build.sh"
+
+  echo "This prepares the Mac for $u to build Loop: only the parts that need an administrator."
+  echo "Nothing is installed in your own account. It asks for your password for sudo."
+
+  step "Xcode (shared by every account)"
+  xcode_step /Applications "$uhome"
+
+  step "$u's copy of the fork"
+  src="$uhome/loop-build-src"
+  if sudo test -f "$src/local-build/install.sh"; then
+    ok "$src"
+  else
+    url="$(git -C "$TOOLS_DIR" remote get-url origin 2>/dev/null || echo "https://github.com/backlog-bbq/LoopWorkspace.git")"
+    url="$(printf '%s' "$url" | sed -E 's#^git@github\.com:#https://github.com/#')"   # $u has no ssh key for GitHub
+    branch="$(git -C "$TOOLS_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+    (cd / && run_sudo -u "$u" -H git clone -q --single-branch -b "$branch" "$url" "$src")
+    ok "Cloned $branch of $url into $src"
+  fi
+
+  step "App Store Connect API key for $u"
+  key="$(for f in "$HOME"/Downloads/AuthKey_*.p8 "$HOME"/AuthKey_*.p8; do [ -f "$f" ] && echo "$f"; done | head -n 1 || true)"
+  if [ -z "$key" ]; then
+    info "No AuthKey_*.p8 in your Downloads. $u's setup will ask for it; to hand it over"
+    info "from here instead, copy it into ~/Downloads and run this again."
+  elif yesno "Give $(basename "$key") to $u? (moves it into $u's ~/.config/loop-build, readable only by $u)" y; then
+    (cd / && run_sudo -u "$u" -H mkdir -p "$uhome/.config/loop-build")
+    (cd / && run_sudo -u "$u" -H chmod 700 "$uhome/.config/loop-build")
+    run_sudo install -o "$u" -g "$ugroup" -m 600 "$key" "$uhome/.config/loop-build/"
+    rm -f "$key"
+    ok "Moved to $uhome/.config/loop-build/$(basename "$key")"
+  fi
+
+  step "Weekly schedule for $u"
+  install_schedule "$u" "$uhome"
+
+  rm -rf "$TOOLS"
+  step "Now $u's part"
+  info "The rest runs as $u, inside $u's home: Ruby, settings, certificates, first build."
+  if yesno "Continue as $u now?" y; then
+    exec sudo -iu "$u" "$src/local-build/install.sh"
+  fi
+  info "Later, from this account, run:"
+  info "  sudo -iu $u $src/local-build/install.sh"
+  exit 0
+}
 # ---------------------------------------------------------------------------
 
 [ -t 0 ] || die "Run this from an interactive terminal (ssh into the Mac and run it there)."
@@ -132,8 +353,26 @@ if [ "$(uname)" != Darwin ] && [ -z "${LOOP_INSTALL_SKIP_OS_CHECK:-}" ]; then
   die "This sets up a Mac; run it on the Mac mini."
 fi
 [ -f "$HERE/loop-build.sh" ] || die "loop-build.sh isn't next to this script ($HERE)."
-[ "$(id -u)" != 0 ] || die "Run this as the user that will build Loop, not as root (it uses sudo when needed)."
+[ "$(id -u)" != 0 ] || die "Run this as a normal user, not as root (it uses sudo when needed)."
 
+CAN_ADMIN=0
+if can_admin; then CAN_ADMIN=1; fi
+build_user=""
+case "${1:-}" in
+  "") ;;
+  --admin) admin_mode "${2:?Usage: install.sh --admin <build-account>}" ;;
+  -h|--help) sed -n '2,/^# Written for/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) die "Unknown option: $1 (see install.sh --help)" ;;
+esac
+
+if [ "$CAN_ADMIN" = 1 ]; then
+  echo "$(whoami) is an administrator account. Builds can run here, or in a separate"
+  echo "Standard account (safer: the signing keys and build tools live only there)."
+  if ! yesno "Build Loop in this account ($(whoami))?" n; then
+    ask build_user "Name of the build account" loopbuilder
+    admin_mode "$build_user"
+  fi
+fi
 echo "This sets up $(whoami) on $(hostname -s 2>/dev/null || hostname) to build Loop and upload it to TestFlight."
 echo "Settings go in $CONFIG; builds happen in $BASE."
 
@@ -171,99 +410,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "Xcode"
-want_app="$(curl -fsSL --max-time 20 "$UPSTREAM_WORKFLOW" 2>/dev/null | grep -oE '/Applications/Xcode[^/"]*\.app' | head -n 1 || true)"
-[ -n "$want_app" ] || want_app="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$TOOLS_DIR/.github/workflows/build_loop.yml" 2>/dev/null | head -n 1 || true)"
-want="$(printf '%s' "$want_app" | sed -E 's#.*/Xcode_?([0-9.]*)\.app#\1#')"
-[ -n "$want" ] || die "Couldn't tell which Xcode LoopKit builds with. Check your network and run this again."
-info "LoopKit builds with Xcode $want."
-
-# Download the xcodes command-line tool into ~/loop-build/tools (no Homebrew).
-get_xcodes() {
-  [ -x "$TOOLS/xcodes" ] && return 0
-  mkdir -p "$TOOLS"
-  info "Downloading the xcodes tool into $TOOLS..."
-  local zip="$TOOLS/xcodes.zip"
-  if curl -fsSL -o "$zip" "$XCODES_URL" && unzip -oq "$zip" -d "$TOOLS" && [ -x "$TOOLS/xcodes" ]; then
-    rm -f "$zip"
-    return 0
-  fi
-  rm -f "$zip"
-  warn "Couldn't download xcodes from $XCODES_URL."
-  return 1
-}
-
-matches_want() { case "$1" in "$want"|"$want".*) return 0 ;; *) return 1 ;; esac; }
-list_xcodes() { # prints "path|version" for each Xcode in /Applications and ~/Applications
-  local x
-  for x in /Applications/Xcode*.app "$HOME"/Applications/Xcode*.app; do
-    [ -d "$x/Contents/Developer" ] || continue
-    printf '%s|%s\n' "$x" "$(xcode_version "$x" || true)"
-  done
-}
-
-chosen="" choice=""
-if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP/Contents/Developer" ] && matches_want "$(xcode_version "$XCODE_APP" || true)"; then
-  chosen="$XCODE_APP"
-fi
-while [ -z "$chosen" ]; do
-  found="$(list_xcodes)"
-  match="$(printf '%s\n' "$found" | while IFS='|' read -r p v; do if [ -n "$p" ] && matches_want "$v"; then echo "$p"; break; fi; done)"
-  if [ -n "$match" ]; then chosen="$match"; break; fi
-
-  if [ -n "$found" ]; then
-    info "None of your Xcodes is $want:"
-    printf '%s\n' "$found" | awk -F'|' '{ printf "     %d) %s (Xcode %s)\n", NR, $1, $2 }'
-  else
-    info "No Xcode found in /Applications or ~/Applications."
-  fi
-  info "Options: i) download Xcode $want into ~/Applications with the 'xcodes' tool (asks for your Apple ID)"
-  [ -n "$found" ] && info "         <number>) use one of the above anyway (the build may fail)"
-  info "         r) I installed it another way; look again"
-  ask choice "Choice" i
-  case "$choice" in
-    i|I)
-      if get_xcodes; then
-        mkdir -p "$HOME/Applications"
-        "$TOOLS/xcodes" install "$want" --directory "$HOME/Applications" \
-          || warn "xcodes didn't finish."
-      fi
-      info "You can also download Xcode $want from developer.apple.com/download/all,"
-      info "unpack it into ~/Applications and choose r."
-      ;;
-    r|R) ;;
-    *[!0-9]*|"") warn "Not a choice." ;;
-    *)
-      chosen="$(printf '%s\n' "$found" | sed -n "${choice}p" | cut -d'|' -f1)"
-      [ -n "$chosen" ] || warn "Not a choice."
-      ;;
-  esac
-done
-XCODE_APP="$chosen"
-XB="$XCODE_APP/Contents/Developer/usr/bin/xcodebuild"
-ok "Using $XCODE_APP (Xcode $(xcode_version "$XCODE_APP" || true))"
-
-if "$XB" -license check >/dev/null 2>&1; then
-  ok "License accepted"
-else
-  info "Accepting the Xcode license (needs your password)..."
-  run_sudo "$XB" -license accept
-fi
-if "$XB" -checkFirstLaunchStatus >/dev/null 2>&1; then
-  ok "First-launch setup done"
-else
-  info "Running Xcode's first-launch setup (needs your password)..."
-  run_sudo "$XB" -runFirstLaunch
-fi
-sdks="$("$XB" -showsdks 2>/dev/null || true)"
-for plat in iOS watchOS; do
-  case "$plat" in iOS) sdk=iphoneos ;; *) sdk=watchos ;; esac   # names in -showsdks output
-  if printf '%s' "$sdks" | grep -q -- "-sdk $sdk"; then
-    ok "$plat platform installed"
-  else
-    info "Downloading the $plat platform (several GB; this takes a while)..."
-    "$XB" -downloadPlatform "$plat"
-  fi
-done
+xcode_step "$HOME/Applications" ""
 
 # ---------------------------------------------------------------------------
 step "Ruby (fastlane needs Ruby $MIN_RUBY or newer)"
@@ -340,6 +487,7 @@ while [ -z "$key" ]; do
     info "  Team Keys > '+', any name, Access: Admin. Download the .p8 (only possible once)."
     info "Then copy it here from the computer you downloaded it on:"
     info "  scp ~/Downloads/AuthKey_*.p8 $(whoami)@$(hostname -s 2>/dev/null || hostname).local:${CONF_DIR#"$HOME"/}/"
+    info "Or put it in your admin account's ~/Downloads and run install.sh --admin $(whoami) there."
     info "(Or type the path of a key file that's already on this Mac.)"
     ask key "Path to the .p8 file (Return to look again)" ""
     key="${key/#\~/$HOME}"
@@ -516,27 +664,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "Weekly schedule"
-plist_tmp="$(mktemp)"
-sed -e "s#/Users/loopbuilder#$HOME#g" -e "s#loopbuilder#$(whoami)#g" "$HERE/$PLIST_NAME.plist" > "$plist_tmp"
-if [ -f "$PLIST_DEST" ] && cmp -s "$plist_tmp" "$PLIST_DEST"; then
-  ok "Already installed: every Sunday at 3:17 AM."
-else
-  info "Builds automatically every Sunday at 3:17 AM when LoopKit or your patches"
-  info "change, and at least every 30 days. It runs while nobody is logged in, which"
-  info "needs one file outside your home folder: $PLIST_DEST (sudo)."
-  if yesno "Install the weekly schedule?" y; then
-    sudo launchctl bootout "system/$PLIST_NAME" >/dev/null 2>&1 || true
-    # Keep a copy where an admin account can reach it if this user can't use sudo.
-    cp "$plist_tmp" "$BASE/$PLIST_NAME.plist"
-    chmod 644 "$BASE/$PLIST_NAME.plist"
-    run_sudo install -o root -g wheel -m 644 "$BASE/$PLIST_NAME.plist" "$PLIST_DEST"
-    run_sudo launchctl bootstrap system "$PLIST_DEST"
-    ok "Installed."
-  else
-    info "Skipped. Build by hand with: $LB build"
-  fi
-fi
-rm -f "$plist_tmp"
+install_schedule "$(whoami)" "$HOME"
 
 # ---------------------------------------------------------------------------
 step "First build"
@@ -566,6 +694,9 @@ if yesno "Build Loop and upload it to TestFlight now?" y; then
   fi
 else
   info "Start it later with: nohup caffeinate -i $LB build >/dev/null 2>&1 &"
+  if [ -f "$PLIST_DEST" ]; then
+    info "or from your admin account, exactly like the weekly run: sudo launchctl kickstart system/$PLIST_NAME"
+  fi
 fi
 echo
 echo "All set."
