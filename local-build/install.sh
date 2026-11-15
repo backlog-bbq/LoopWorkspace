@@ -170,6 +170,8 @@ xcode_step() {
   info "LoopKit builds with Xcode $want."
 
   matches_want() { case "$1" in "$want"|"$want".*) return 0 ;; *) return 1 ;; esac; }
+  # A newer Xcode in the same major series (27.2 when LoopKit names 27.1) builds Loop too.
+  usable() { [ -n "$1" ] && [ "${1%%.*}" = "${want%%.*}" ] && version_ge "$1" "$want"; }
   list_xcodes() { # prints "path|version" for each Xcode found
     for x in /Applications/Xcode*.app "$HOME"/Applications/Xcode*.app ${other_home:+"$other_home"/Applications/Xcode*.app}; do
       [ -d "$x/Contents/Developer" ] || continue
@@ -177,17 +179,25 @@ xcode_step() {
     done | awk '!seen[$0]++'
   }
 
-  if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP/Contents/Developer" ] && matches_want "$(xcode_version "$XCODE_APP" || true)"; then
+  if [ -n "$XCODE_APP" ] && [ -d "$XCODE_APP/Contents/Developer" ] && usable "$(xcode_version "$XCODE_APP" || true)"; then
     chosen="$XCODE_APP"
   fi
   while [ -z "$chosen" ]; do
     found="$(list_xcodes)"
+    # Prefer the exact version; otherwise the newest usable one.
     match="$(printf '%s\n' "$found" | while IFS='|' read -r p v; do if [ -n "$p" ] && matches_want "$v"; then echo "$p"; break; fi; done)"
+    if [ -z "$match" ]; then
+      match="$(printf '%s\n' "$found" | while IFS='|' read -r p v; do if usable "$v"; then echo "$v|$p"; fi; done \
+        | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -d'|' -f2)"
+      if [ -n "$match" ]; then
+        info "Xcode $want isn't installed; using the newer $(xcode_version "$match" || true), which builds Loop too."
+      fi
+    fi
     if [ -n "$match" ]; then chosen="$match"; break; fi
-    [ "$CAN_ADMIN" = 1 ] || die "Xcode $want isn't installed. $(admin_hint)"
+    [ "$CAN_ADMIN" = 1 ] || die "Xcode $want (or a newer ${want%%.*}.x) isn't installed. $(admin_hint)"
 
     if [ -n "$found" ]; then
-      info "None of the installed Xcodes is $want:"
+      info "None of the installed Xcodes is $want or a newer ${want%%.*}.x:"
       printf '%s\n' "$found" | awk -F'|' '{ printf "     %d) %s (Xcode %s)\n", NR, $1, $2 }'
     else
       info "No Xcode found."

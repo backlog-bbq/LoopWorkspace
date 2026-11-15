@@ -275,10 +275,11 @@ select_xcode() {
   elif [ -n "$want" ] && [ -d "$app" ]; then
     wantv="$(printf '%s' "$want" | sed -E 's#.*/Xcode_?([0-9.]*)\.app#\1#')"
     havev="$(xcode_version "$app" || true)"
-    case "$havev" in
-      "$wantv"|"$wantv".*|"") ;;
-      *) log "WARNING: LoopKit now builds with Xcode $wantv, but XCODE_APP is Xcode $havev ($app). If the build fails, install Xcode $wantv (run install.sh again) or update XCODE_APP." ;;
-    esac
+    # A newer Xcode in the same major series is fine; warn about older or other majors.
+    if [ -n "$havev" ] && [ -n "$wantv" ] \
+       && { [ "${havev%%.*}" != "${wantv%%.*}" ] || ! version_ge "$havev" "$wantv"; }; then
+      log "WARNING: LoopKit now builds with Xcode $wantv, but XCODE_APP is Xcode $havev ($app). If the build fails, install Xcode $wantv (run install.sh again) or update XCODE_APP."
+    fi
   fi
   [ -d "$app/Contents/Developer" ] || die "Xcode not found at $app. Install that version at that path (for example with 'xcodes'), or set XCODE_APP in the config."
   export DEVELOPER_DIR="$app/Contents/Developer"
