@@ -34,9 +34,34 @@ git clone --single-branch -b claude/loop-headless-mac-dexcom-share-s4f8jv \
 
 `install.sh` does every step below for you and asks only for what it can't find out
 itself: your Team ID, the App Store Connect API key, and the backup repo on your git
-server. It installs Ruby (and Homebrew if needed), gets the right Xcode ready,
-writes the settings file, runs `setup`, installs the weekly schedule and starts the
-first build in the background. It asks for your password when a step needs `sudo`.
+server. It gets the right Xcode ready, builds a private Ruby, writes the settings
+file, runs `setup`, installs the weekly schedule and starts the first build in the
+background.
+
+### What it installs, and where
+
+Everything goes in your home folder; Homebrew isn't used or needed.
+
+| What | Where |
+| --- | --- |
+| Ruby 3.4 with its own OpenSSL and libyaml, built from source by `ruby-build` (10-20 min, once) | `~/loop-build/ruby` |
+| `ruby-build`, and `xcodes` if it has to download Xcode | `~/loop-build/tools` |
+| fastlane and the other gems | `~/loop-build/bundle` |
+| LoopWorkspace, logs, build output, certificate repo | `~/loop-build` |
+| Settings and API key | `~/.config/loop-build` |
+| Xcode, only if you don't already have the right version | `~/Applications` |
+| Backup deploy key | `~/.ssh/loop_match_backup` |
+
+It uses `sudo` only for these, and asks for your password each time:
+
+- Accepting the Xcode license and Xcode's first-launch setup, which Xcode needs before
+  it can build anything. If you've already opened that Xcode, both are done and skipped.
+- The weekly schedule, `/Library/LaunchDaemons/com.loopbuild.auto.plist`, if you want
+  it: a schedule that runs with nobody logged in has to be a system file. Say no and
+  build by hand instead.
+
+Downloading the iOS and watchOS platforms, if Xcode doesn't have them yet, is done
+by Xcode's own tool without `sudo`.
 
 Have these ready before you start:
 
@@ -56,7 +81,9 @@ to see what one of them does.
 
 Do everything over ssh on the Mac mini, as the user that will run the builds. Your
 own account is fine. (A separate non-admin user is safer; if you make one, do every
-step as that user, except the `sudo` commands, which need an admin.)
+step as that user. The `sudo` steps then need an admin: run `install.sh` as that
+user, and when it stops at a `sudo` step, run the command it shows from an admin
+account, then run `install.sh` again.)
 
 ### 1. Check the clone and link the script
 
@@ -84,28 +111,19 @@ ln -sf ~/loop-build-src/local-build/loop-build.sh ~/loop-build/loop-build.sh
 `check` lists what's still missing, with the command to fix each item. Run it again
 after each step below; you're done when it ends with "Ready for setup".
 
-### 2. Install Ruby
-
-fastlane needs Ruby 3 or newer; macOS's own Ruby is too old.
-
-```sh
-brew install ruby
-```
-
-The script finds Homebrew's Ruby on its own; you don't need to change your PATH.
-
-### 3. Get the right Xcode ready
+### 2. Get the right Xcode ready
 
 See which Xcode LoopKit builds with, and which ones you have:
 
 ```sh
 grep -o 'Xcode_[0-9.]*' ~/loop-build-src/.github/workflows/build_loop.yml | head -1
-for x in /Applications/Xcode*.app; do echo "$x: $("$x/Contents/Developer/usr/bin/xcodebuild" -version | head -1)"; done
+for x in /Applications/Xcode*.app ~/Applications/Xcode*.app; do [ -d "$x" ] && echo "$x: $(defaults read "$x/Contents/Info" CFBundleShortVersionString)"; done
 ```
 
 If one of yours is that version, you'll put its path in `XCODE_APP` in step 5. If
-not, install it, for example with `brew install xcodesorg/made/xcodes` and then
-`xcodes install <version>` (it asks for your Apple ID once, in the terminal).
+not, download it from developer.apple.com/download/all and unpack it into
+`~/Applications`, or use the `xcodes` tool (github.com/XcodesOrg/xcodes):
+`xcodes install <version> --directory ~/Applications`.
 
 Then prepare it. Set `XB` to that Xcode's `xcodebuild`, for example:
 
@@ -116,6 +134,25 @@ sudo "$XB" -runFirstLaunch
 "$XB" -downloadPlatform iOS
 "$XB" -downloadPlatform watchOS
 ```
+
+### 3. Build a private Ruby
+
+fastlane's Bundler needs Ruby 3.2 or newer; macOS's own Ruby (2.6) is too old. Build
+one into `~/loop-build/ruby` with `ruby-build`. It compiles OpenSSL itself; libyaml
+(needed for YAML) is added in front of the Ruby recipe because macOS doesn't have it:
+
+```sh
+mkdir -p ~/loop-build/tools
+git clone --depth 1 https://github.com/rbenv/ruby-build.git ~/loop-build/tools/ruby-build
+V=$(cd ~/loop-build/tools/ruby-build/share/ruby-build && ls -d 3.4.* | sort -t. -k3,3n | tail -1)
+{ echo 'install_package "yaml-0.2.5" "https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz#c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4"'
+  cat ~/loop-build/tools/ruby-build/share/ruby-build/$V; } > ~/loop-build/tools/loop-ruby-$V
+DEVELOPER_DIR="${XB%/usr/bin/xcodebuild}" \
+RUBY_CONFIGURE_OPTS="--with-libyaml-dir=$HOME/loop-build/ruby --disable-install-doc" \
+  ~/loop-build/tools/ruby-build/bin/ruby-build ~/loop-build/tools/loop-ruby-$V ~/loop-build/ruby
+```
+
+`loop-build.sh` uses `~/loop-build/ruby` automatically; you don't need to change PATH.
 
 ### 4. Collect your Apple details
 

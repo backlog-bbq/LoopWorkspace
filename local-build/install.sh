@@ -5,11 +5,17 @@
 #
 #   ~/loop-build-src/local-build/install.sh
 #
-# It walks through every step in README.md: links the script, installs Ruby,
-# gets Xcode ready, asks for your Apple details, writes the settings file, sets
-# up the certificate backup, runs 'loop-build.sh setup', installs the weekly
+# It walks through every step in README.md: links the script, gets Xcode ready,
+# builds a private Ruby, asks for your Apple details, writes the settings file,
+# sets up the certificate backup, runs 'loop-build.sh setup', installs the weekly
 # schedule and starts the first build. Run it again any time: finished steps
 # are detected and skipped, and your earlier answers are offered as defaults.
+#
+# Everything it installs goes in your home folder (~/loop-build, and Xcode in
+# ~/Applications if it has to download one). It doesn't use Homebrew. sudo is
+# used only for what Xcode itself requires (accepting its license, its
+# first-launch setup) and, if you choose, the weekly schedule file in
+# /Library/LaunchDaemons.
 #
 # Written for the bash 3.2 that ships with macOS.
 
@@ -25,15 +31,12 @@ MATCH_REPO="$BASE/match-secrets.git"
 PLIST_NAME="com.loopbuild.auto"
 PLIST_DEST="/Library/LaunchDaemons/$PLIST_NAME.plist"
 UPSTREAM_WORKFLOW="https://raw.githubusercontent.com/LoopKit/LoopWorkspace/main/.github/workflows/build_loop.yml"
-
-add_paths() {
-  local d
-  for d in /usr/local/bin /opt/homebrew/bin /usr/local/opt/ruby/bin /opt/homebrew/opt/ruby/bin; do
-    case ":$PATH:" in *":$d:"*) ;; *) if [ -d "$d" ]; then PATH="$d:$PATH"; fi ;; esac
-  done
-  export PATH
-}
-add_paths
+RUBY_DIR="$BASE/ruby"                            # private Ruby, built by this script
+TOOLS="$BASE/tools"                              # ruby-build and xcodes live here
+# libyaml isn't on a Mac without Homebrew, and Ruby needs it for YAML (Bundler won't run without it).
+LIBYAML_URL="https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz#c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4"
+XCODES_URL="https://github.com/XcodesOrg/xcodes/releases/latest/download/xcodes.zip"
+MIN_RUBY=3.2                                     # Bundler 4, which LoopKit's Gemfile.lock pins, needs 3.2
 
 STEP=0
 step() { STEP=$((STEP + 1)); printf '\n\033[1m%s. %s\033[0m\n' "$STEP" "$*"; }
@@ -66,6 +69,16 @@ yesno() {
     IFS= read -r ans || die "No input."
     case "${ans:-$2}" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; esac
   done
+}
+# Run a command with sudo. If this user can't use sudo (a non-admin account), say
+# exactly what an admin needs to run, so it can be done from another account.
+run_sudo() {
+  if sudo "$@"; then return 0; fi
+  local q="" a
+  for a in "$@"; do q="$q '$a'"; done
+  die "That step needs an admin. From an admin account, run:
+    sudo$q
+then run this script again."
 }
 pause() { printf '   %s Press Return when done. ' "$*"; IFS= read -r _ || true; }
 
@@ -157,28 +170,6 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "Ruby (fastlane needs Ruby 3 or newer)"
-ruby_ok() { command -v ruby >/dev/null && command -v bundle >/dev/null \
-  && version_ge "$(ruby -e 'print RUBY_VERSION' 2>/dev/null || echo 0)" 3.0; }
-if ruby_ok; then
-  ok "Ruby $(ruby -e 'print RUBY_VERSION') at $(command -v ruby)"
-else
-  if ! command -v brew >/dev/null; then
-    info "Homebrew isn't installed. It's the usual way to get a current Ruby on a Mac."
-    if yesno "Install Homebrew now? (runs the official installer from brew.sh; it asks for your password)" y; then
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-      add_paths
-    fi
-    command -v brew >/dev/null || die "Install Homebrew (https://brew.sh) and run this again."
-  fi
-  info "Installing Ruby with Homebrew..."
-  brew install ruby
-  add_paths
-  ruby_ok || die "Ruby 3 still isn't available. Check 'brew info ruby', then run this again."
-  ok "Ruby $(ruby -e 'print RUBY_VERSION') at $(command -v ruby)"
-fi
-
-# ---------------------------------------------------------------------------
 step "Xcode"
 want_app="$(curl -fsSL --max-time 20 "$UPSTREAM_WORKFLOW" 2>/dev/null | grep -oE '/Applications/Xcode[^/"]*\.app' | head -n 1 || true)"
 [ -n "$want_app" ] || want_app="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$TOOLS_DIR/.github/workflows/build_loop.yml" 2>/dev/null | head -n 1 || true)"
@@ -186,10 +177,25 @@ want="$(printf '%s' "$want_app" | sed -E 's#.*/Xcode_?([0-9.]*)\.app#\1#')"
 [ -n "$want" ] || die "Couldn't tell which Xcode LoopKit builds with. Check your network and run this again."
 info "LoopKit builds with Xcode $want."
 
+# Download the xcodes command-line tool into ~/loop-build/tools (no Homebrew).
+get_xcodes() {
+  [ -x "$TOOLS/xcodes" ] && return 0
+  mkdir -p "$TOOLS"
+  info "Downloading the xcodes tool into $TOOLS..."
+  local zip="$TOOLS/xcodes.zip"
+  if curl -fsSL -o "$zip" "$XCODES_URL" && unzip -oq "$zip" -d "$TOOLS" && [ -x "$TOOLS/xcodes" ]; then
+    rm -f "$zip"
+    return 0
+  fi
+  rm -f "$zip"
+  warn "Couldn't download xcodes from $XCODES_URL."
+  return 1
+}
+
 matches_want() { case "$1" in "$want"|"$want".*) return 0 ;; *) return 1 ;; esac; }
-list_xcodes() { # prints "path|version" for each Xcode in /Applications
+list_xcodes() { # prints "path|version" for each Xcode in /Applications and ~/Applications
   local x
-  for x in /Applications/Xcode*.app; do
+  for x in /Applications/Xcode*.app "$HOME"/Applications/Xcode*.app; do
     [ -d "$x/Contents/Developer" ] || continue
     printf '%s|%s\n' "$x" "$(xcode_version "$x" || true)"
   done
@@ -208,16 +214,21 @@ while [ -z "$chosen" ]; do
     info "None of your Xcodes is $want:"
     printf '%s\n' "$found" | awk -F'|' '{ printf "     %d) %s (Xcode %s)\n", NR, $1, $2 }'
   else
-    info "No Xcode is installed in /Applications."
+    info "No Xcode found in /Applications or ~/Applications."
   fi
-  info "Options: i) install Xcode $want with the 'xcodes' tool (asks for your Apple ID)"
+  info "Options: i) download Xcode $want into ~/Applications with the 'xcodes' tool (asks for your Apple ID)"
   [ -n "$found" ] && info "         <number>) use one of the above anyway (the build may fail)"
   info "         r) I installed it another way; look again"
   ask choice "Choice" i
   case "$choice" in
     i|I)
-      if ! command -v xcodes >/dev/null; then brew install xcodesorg/made/xcodes; fi
-      xcodes install "$want" || warn "xcodes didn't finish. You can also download Xcode $want at developer.apple.com/download/all and put it in /Applications."
+      if get_xcodes; then
+        mkdir -p "$HOME/Applications"
+        "$TOOLS/xcodes" install "$want" --directory "$HOME/Applications" \
+          || warn "xcodes didn't finish."
+      fi
+      info "You can also download Xcode $want from developer.apple.com/download/all,"
+      info "unpack it into ~/Applications and choose r."
       ;;
     r|R) ;;
     *[!0-9]*|"") warn "Not a choice." ;;
@@ -235,24 +246,60 @@ if "$XB" -license check >/dev/null 2>&1; then
   ok "License accepted"
 else
   info "Accepting the Xcode license (needs your password)..."
-  sudo "$XB" -license accept
+  run_sudo "$XB" -license accept
 fi
 if "$XB" -checkFirstLaunchStatus >/dev/null 2>&1; then
   ok "First-launch setup done"
 else
   info "Running Xcode's first-launch setup (needs your password)..."
-  sudo "$XB" -runFirstLaunch
+  run_sudo "$XB" -runFirstLaunch
 fi
 sdks="$("$XB" -showsdks 2>/dev/null || true)"
 for plat in iOS watchOS; do
-  lower="$(printf '%s' "$plat" | tr '[:upper:]' '[:lower:]')"
-  if printf '%s' "$sdks" | grep -q "$lower"; then
+  case "$plat" in iOS) sdk=iphoneos ;; *) sdk=watchos ;; esac   # names in -showsdks output
+  if printf '%s' "$sdks" | grep -q -- "-sdk $sdk"; then
     ok "$plat platform installed"
   else
     info "Downloading the $plat platform (several GB; this takes a while)..."
     "$XB" -downloadPlatform "$plat"
   fi
 done
+
+# ---------------------------------------------------------------------------
+step "Ruby (fastlane needs Ruby $MIN_RUBY or newer)"
+ruby_ok() { # ruby_ok /path/to/ruby
+  [ -x "$1" ] && version_ge "$("$1" -e 'print RUBY_VERSION' 2>/dev/null || echo 0)" "$MIN_RUBY" \
+    && "$1" -e 'require "psych"; require "openssl"' >/dev/null 2>&1
+}
+if ruby_ok "$RUBY_DIR/bin/ruby"; then
+  ok "Private Ruby $("$RUBY_DIR/bin/ruby" -e 'print RUBY_VERSION') in $RUBY_DIR"
+else
+  info "Building a private Ruby in $RUBY_DIR with ruby-build. Nothing is installed"
+  info "outside that folder. It compiles OpenSSL and Ruby, so it takes 10-20 minutes."
+  mkdir -p "$TOOLS"
+  if [ -d "$TOOLS/ruby-build/.git" ]; then
+    git -C "$TOOLS/ruby-build" pull -q --ff-only 2>/dev/null || warn "Couldn't update ruby-build; using the copy there."
+  else
+    git clone -q --depth 1 https://github.com/rbenv/ruby-build.git "$TOOLS/ruby-build"
+  fi
+  # Newest Ruby 3.4 that ruby-build knows, with libyaml added in front.
+  rver="$(cd "$TOOLS/ruby-build/share/ruby-build" && printf '%s\n' 3.4.* | grep -E '^3\.4\.[0-9]+$' | sort -t. -k3,3n | tail -n 1)"
+  [ -n "$rver" ] || die "ruby-build doesn't list a Ruby 3.4 release."
+  def="$TOOLS/loop-ruby-$rver"
+  {
+    echo "install_package \"yaml-0.2.5\" \"$LIBYAML_URL\""
+    cat "$TOOLS/ruby-build/share/ruby-build/$rver"
+  } > "$def"
+  # The compiler comes from the Xcode chosen above; no command line tools install needed.
+  DEVELOPER_DIR="$XCODE_APP/Contents/Developer" \
+  RUBY_CONFIGURE_OPTS="--with-libyaml-dir=$RUBY_DIR --disable-install-doc" \
+    "$TOOLS/ruby-build/bin/ruby-build" "$def" "$RUBY_DIR" \
+    || die "Building Ruby failed; the lines above say why. Fix that and run this again."
+  ruby_ok "$RUBY_DIR/bin/ruby" || die "Ruby was built but can't load YAML or OpenSSL support."
+  ok "Private Ruby $("$RUBY_DIR/bin/ruby" -e 'print RUBY_VERSION') in $RUBY_DIR"
+fi
+PATH="$RUBY_DIR/bin:$PATH"
+export PATH
 
 # ---------------------------------------------------------------------------
 step "Your Apple Developer team"
@@ -473,12 +520,21 @@ plist_tmp="$(mktemp)"
 sed -e "s#/Users/loopbuilder#$HOME#g" -e "s#loopbuilder#$(whoami)#g" "$HERE/$PLIST_NAME.plist" > "$plist_tmp"
 if [ -f "$PLIST_DEST" ] && cmp -s "$plist_tmp" "$PLIST_DEST"; then
   ok "Already installed: every Sunday at 3:17 AM."
-elif yesno "Build automatically every Sunday at 3:17 AM when LoopKit or your patches change (and at least every 30 days)?" y; then
-  info "Installing $PLIST_DEST (needs your password)..."
-  sudo launchctl bootout "system/$PLIST_NAME" >/dev/null 2>&1 || true
-  sudo install -o root -g wheel -m 644 "$plist_tmp" "$PLIST_DEST"
-  sudo launchctl bootstrap system "$PLIST_DEST"
-  ok "Installed."
+else
+  info "Builds automatically every Sunday at 3:17 AM when LoopKit or your patches"
+  info "change, and at least every 30 days. It runs while nobody is logged in, which"
+  info "needs one file outside your home folder: $PLIST_DEST (sudo)."
+  if yesno "Install the weekly schedule?" y; then
+    sudo launchctl bootout "system/$PLIST_NAME" >/dev/null 2>&1 || true
+    # Keep a copy where an admin account can reach it if this user can't use sudo.
+    cp "$plist_tmp" "$BASE/$PLIST_NAME.plist"
+    chmod 644 "$BASE/$PLIST_NAME.plist"
+    run_sudo install -o root -g wheel -m 644 "$BASE/$PLIST_NAME.plist" "$PLIST_DEST"
+    run_sudo launchctl bootstrap system "$PLIST_DEST"
+    ok "Installed."
+  else
+    info "Skipped. Build by hand with: $LB build"
+  fi
 fi
 rm -f "$plist_tmp"
 

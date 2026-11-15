@@ -56,10 +56,12 @@ LOCK_DIR="$BASE/.lock"
 MATCH_OWNER="local-match"
 MATCH_FAKE_URL="https://github.com/$MATCH_OWNER/Match-Secrets.git"
 
-# launchd and ssh start with a minimal PATH; prefer Homebrew Ruby over the old system Ruby.
-for d in /usr/local/bin /opt/homebrew/bin /usr/local/opt/ruby/bin /opt/homebrew/opt/ruby/bin; do
+# launchd and ssh start with a minimal PATH. Use the private Ruby install.sh builds
+# in $BASE/ruby; otherwise a Homebrew Ruby if there is one (macOS's own is too old).
+for d in /usr/local/bin /opt/homebrew/bin /usr/local/opt/ruby/bin /opt/homebrew/opt/ruby/bin "$BASE/ruby/bin"; do
   if [ -d "$d" ]; then PATH="$d:$PATH"; fi
 done
+MIN_RUBY=3.2   # Bundler 4, pinned in LoopKit's Gemfile.lock, needs Ruby 3.2
 export PATH
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
@@ -198,11 +200,11 @@ check_tools() {
   local gv
   gv="$(git --version | awk '{print $3}')"
   version_ge "$gv" 2.31 || die "git $gv is too old (need 2.31+)."
-  command -v ruby >/dev/null || die "Ruby not found. Install it with: brew install ruby"
-  command -v bundle >/dev/null || die "Bundler not found. Install Homebrew Ruby (brew install ruby), which includes it."
+  command -v ruby >/dev/null || die "Ruby not found. Run install.sh to build a private Ruby in $BASE/ruby."
+  command -v bundle >/dev/null || die "Bundler not found. Run install.sh to build a private Ruby in $BASE/ruby."
   local rv
   rv="$(ruby -e 'print RUBY_VERSION')"
-  version_ge "$rv" 3.0 || die "Ruby $rv is too old for fastlane. Install Homebrew Ruby: brew install ruby"
+  version_ge "$rv" "$MIN_RUBY" || die "Ruby $rv is too old (need $MIN_RUBY+). Run install.sh to build a private Ruby in $BASE/ruby."
 }
 
 # Bring the clone that holds this script and your patches up to date, so changes
@@ -526,11 +528,11 @@ cmd_check() {
 
   echo "Tools"
   if command -v git >/dev/null && version_ge "$(git --version | awk '{print $3}')" 2.31; then ok "git $(git --version | awk '{print $3}')"
-  else todo "git 2.31 or newer is needed (install the Xcode command line tools or 'brew install git')."; fi
-  if command -v ruby >/dev/null && version_ge "$(ruby -e 'print RUBY_VERSION')" 3.0 && command -v bundle >/dev/null; then
+  else todo "git 2.31 or newer is needed (it comes with Xcode)."; fi
+  if command -v ruby >/dev/null && version_ge "$(ruby -e 'print RUBY_VERSION')" "$MIN_RUBY" && command -v bundle >/dev/null; then
     ok "Ruby $(ruby -e 'print RUBY_VERSION') at $(command -v ruby)"
   else
-    todo "Ruby 3 or newer is needed. Run: brew install ruby"
+    todo "Ruby $MIN_RUBY or newer is needed. Run install.sh to build a private one in $BASE/ruby."
   fi
 
   echo "Xcode"
