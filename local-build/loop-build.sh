@@ -12,6 +12,7 @@
 #     to be signed in to Xcode. Works over ssh and from launchd.
 #
 # Commands:
+#   check                       List what still needs doing before setup/build.
 #   setup [--import-match URL]  One-time: create the local match repo (or copy an
 #                               existing Match-Secrets repo), register identifiers,
 #                               create or download certificates.
@@ -77,6 +78,10 @@ check_private() {
     *00) ;;
     *) die "$1 is readable by other users. Run: chmod 600 \"$1\"" ;;
   esac
+}
+is_private() {
+  [ "$(file_owner "$1")" = "$(id -u)" ] || return 1
+  case "$(file_mode "$1")" in *00) return 0 ;; *) return 1 ;; esac
 }
 
 # Hide any user:password@ in a URL before it is logged.
@@ -325,6 +330,17 @@ ensure_certs() {
   die "fastlane certs failed. If Apple says you have too many certificates, revoke an unused distribution certificate at developer.apple.com, then run '$0 build'."
 }
 
+# Run git with the backup repo's credentials (MATCH_BACKUP_SSH_KEY), never prompting:
+# under launchd a prompt would hang, so fail instead.
+backup_git() {
+  local ssh_cmd="${GIT_SSH_COMMAND:-ssh}"
+  if [ -n "$MATCH_BACKUP_SSH_KEY" ]; then
+    [ -f "$MATCH_BACKUP_SSH_KEY" ] || { log "WARNING: MATCH_BACKUP_SSH_KEY not found: $MATCH_BACKUP_SSH_KEY"; return 1; }
+    ssh_cmd="ssh -i '$MATCH_BACKUP_SSH_KEY' -o IdentitiesOnly=yes"
+  fi
+  GIT_SSH_COMMAND="$ssh_cmd -o BatchMode=yes" GIT_TERMINAL_PROMPT=0 git "$@"
+}
+
 # Mirror the local certificate repo to MATCH_BACKUP_URL, if set. That URL is the
 # only place this script ever pushes to. Returns non-zero if the push fails.
 backup_match() {
@@ -336,14 +352,7 @@ backup_match() {
     *github.com*) log "Note: MATCH_BACKUP_URL points at GitHub; a repo on your own git server keeps certificates off GitHub." ;;
   esac
   log "Backing up the certificate repo to $shown"
-  local ssh_cmd="${GIT_SSH_COMMAND:-ssh}"
-  if [ -n "$MATCH_BACKUP_SSH_KEY" ]; then
-    [ -f "$MATCH_BACKUP_SSH_KEY" ] || { log "WARNING: MATCH_BACKUP_SSH_KEY not found: $MATCH_BACKUP_SSH_KEY"; return 1; }
-    ssh_cmd="ssh -i '$MATCH_BACKUP_SSH_KEY' -o IdentitiesOnly=yes"
-  fi
-  # BatchMode: fail instead of waiting for a password or host-key prompt under launchd.
-  if GIT_SSH_COMMAND="$ssh_cmd -o BatchMode=yes" GIT_TERMINAL_PROMPT=0 \
-       git -C "$MATCH_REPO" push -q --mirror "$MATCH_BACKUP_URL"; then
+  if backup_git -C "$MATCH_REPO" push -q --mirror "$MATCH_BACKUP_URL"; then
     mkdir -p "$STATE_DIR"
     date +%s > "$STATE_DIR/last_match_backup_epoch"
     return 0
@@ -460,6 +469,119 @@ cmd_backup() {
   log "Backup complete."
 }
 
+# Report everything that still needs doing, without changing anything.
+cmd_check() {
+  local problems=0 v val app="" wf xb sdks
+  ok()   { printf '  ok    %s\n' "$*"; }
+  todo() { printf '  TODO  %s\n' "$*"; problems=$((problems + 1)); }
+  note() { printf '  note  %s\n' "$*"; }
+
+  echo "Settings: $CONFIG"
+  if [ ! -f "$CONFIG" ]; then
+    todo "No config yet. Run: mkdir -p ~/.config/loop-build && cp ~/loop-build-src/local-build/loop-build.conf.example \"$CONFIG\" && chmod 600 \"$CONFIG\""
+  else
+    if is_private "$CONFIG"; then ok "only you can read it"; else todo "Run: chmod 600 \"$CONFIG\""; fi
+    # shellcheck source=/dev/null
+    . "$CONFIG"
+    for v in TEAMID FASTLANE_KEY_ID FASTLANE_ISSUER_ID FASTLANE_KEY_PATH MATCH_PASSWORD; do
+      val="${!v:-}"
+      case "$val" in
+        ""|*XXXXXXXXXX*|*xxxxxxxx-*|change-me) todo "Fill in $v in the config." ;;
+        *) ok "$v is set" ;;
+      esac
+    done
+    if [ -n "${TEAMID:-}" ] && ! [[ ${TEAMID:-} =~ ^[A-Z0-9]{10}$ ]]; then
+      todo "TEAMID should be 10 capital letters/digits (developer.apple.com > Account > Membership details)."
+    fi
+    FASTLANE_KEY_PATH="${FASTLANE_KEY_PATH:-}"
+    FASTLANE_KEY_PATH="${FASTLANE_KEY_PATH/#\~/$HOME}"
+    case "$FASTLANE_KEY_PATH" in
+      ""|*XXXXXXXXXX*) ;;
+      *) if [ ! -f "$FASTLANE_KEY_PATH" ]; then todo "API key file not found: $FASTLANE_KEY_PATH"
+         elif is_private "$FASTLANE_KEY_PATH"; then ok "API key file found, only you can read it"
+         else todo "Run: chmod 600 \"$FASTLANE_KEY_PATH\""; fi ;;
+    esac
+  fi
+  XCODE_APP="${XCODE_APP:-}"
+  TOOLS_REPO="${TOOLS_REPO:-}"; TOOLS_REPO="${TOOLS_REPO/#\~/$HOME}"
+  PATCH_DIR="${PATCH_DIR/#\~/$HOME}"
+  MATCH_BACKUP_URL="${MATCH_BACKUP_URL:-}"
+  MATCH_BACKUP_SSH_KEY="${MATCH_BACKUP_SSH_KEY:-}"; MATCH_BACKUP_SSH_KEY="${MATCH_BACKUP_SSH_KEY/#\~/$HOME}"
+
+  echo "Tools"
+  if command -v git >/dev/null && version_ge "$(git --version | awk '{print $3}')" 2.31; then ok "git $(git --version | awk '{print $3}')"
+  else todo "git 2.31 or newer is needed (install the Xcode command line tools or 'brew install git')."; fi
+  if command -v ruby >/dev/null && version_ge "$(ruby -e 'print RUBY_VERSION')" 3.0 && command -v bundle >/dev/null; then
+    ok "Ruby $(ruby -e 'print RUBY_VERSION') at $(command -v ruby)"
+  else
+    todo "Ruby 3 or newer is needed. Run: brew install ruby"
+  fi
+
+  echo "Xcode"
+  if [ -n "$XCODE_APP" ]; then
+    app="$XCODE_APP"
+  else
+    for wf in "$SRC/.github/workflows/build_loop.yml" "${TOOLS_REPO:-$HOME/loop-build-src}/.github/workflows/build_loop.yml"; do
+      [ -f "$wf" ] || continue
+      app="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$wf" | head -n 1 || true)"
+      [ -n "$app" ] && break
+    done
+  fi
+  if [ -z "$app" ]; then
+    todo "Can't tell which Xcode to use. Set XCODE_APP in the config (find yours with: ls -d /Applications/Xcode*.app)."
+  elif [ ! -d "$app/Contents/Developer" ]; then
+    todo "Xcode not found at $app. Install that version there, or set XCODE_APP in the config to the Xcode you have (ls -d /Applications/Xcode*.app)."
+  else
+    xb="$app/Contents/Developer/usr/bin/xcodebuild"
+    ok "$app ($("$xb" -version 2>/dev/null | head -n 1))"
+    if "$xb" -license check >/dev/null 2>&1; then ok "license accepted"
+    else todo "Accept the Xcode license: sudo \"$xb\" -license accept"; fi
+    if "$xb" -checkFirstLaunchStatus >/dev/null 2>&1; then ok "first-launch setup done"
+    else todo "Finish Xcode's first-launch setup: sudo \"$xb\" -runFirstLaunch"; fi
+    sdks="$("$xb" -showsdks 2>/dev/null || true)"
+    if printf '%s' "$sdks" | grep -q iphoneos; then ok "iOS platform installed"
+    else todo "Install the iOS platform: \"$xb\" -downloadPlatform iOS"; fi
+    if printf '%s' "$sdks" | grep -q watchos; then ok "watchOS platform installed"
+    else todo "Install the watchOS platform (Loop has a Watch app): \"$xb\" -downloadPlatform watchOS"; fi
+  fi
+
+  echo "Script and patches"
+  if [ -z "$TOOLS_REPO" ]; then
+    note "TOOLS_REPO isn't set, so patches aren't pulled from your fork automatically."
+  elif [ -f "$TOOLS_REPO/local-build/loop-build.sh" ]; then
+    ok "$TOOLS_REPO (branch $(git -C "$TOOLS_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown))"
+  else
+    todo "$TOOLS_REPO has no local-build/ folder. Clone the branch that has it: see local-build/README.md, step 2."
+  fi
+  if [ -d "$PATCH_DIR" ]; then
+    ok "$(cd "$PATCH_DIR" && find . -type f -name '*.patch' | wc -l | tr -d ' ') patch(es) in $PATCH_DIR"
+  else
+    note "No patch folder at $PATCH_DIR; builds will be unmodified LoopKit code."
+  fi
+
+  echo "Certificates"
+  if [ -d "$MATCH_REPO" ]; then ok "certificate repo exists ($MATCH_REPO)"
+  else note "No certificate repo yet; 'setup' creates it."; fi
+  if [ -z "$MATCH_BACKUP_URL" ]; then
+    note "MATCH_BACKUP_URL isn't set; nothing backs up your certificate repo."
+  elif backup_git ls-remote "$MATCH_BACKUP_URL" >/dev/null 2>&1; then
+    ok "backup repo reachable: $(redact_url "$MATCH_BACKUP_URL")"
+  else
+    todo "Can't reach the backup repo $(redact_url "$MATCH_BACKUP_URL"). Check the URL and key, and connect once by hand to accept the server's host key."
+  fi
+
+  echo
+  if [ "$problems" -gt 0 ]; then
+    echo "$problems thing(s) to do before building."
+    return 1
+  fi
+  if [ -d "$MATCH_REPO" ]; then
+    echo "Ready. Build and upload with: $0 build"
+  else
+    echo "Ready for setup. Run: $0 setup"
+  fi
+}
+
 fmt_epoch() { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M'; }
 
 cmd_status() {
@@ -516,6 +638,7 @@ case "${1:-help}" in
   auto)       cmd_build auto ;;
   build)      cmd_build build ;;
   status)     cmd_status ;;
+  check)      cmd_check ;;
   backup)     cmd_backup ;;
   nuke-certs) cmd_nuke_certs ;;
   help|-h|--help) usage ;;

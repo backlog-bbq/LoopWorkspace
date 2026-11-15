@@ -1,83 +1,222 @@
 # Building Loop on your own Mac
 
-This folder adds two ways to build Loop and upload it to TestFlight on a headless Mac
-instead of GitHub's machines. Pick one.
-
-| File | What it is |
-| --- | --- |
-| `loop-build.sh` | The fully local build script (Option A). Run `loop-build.sh help` for all commands. |
-| `loop-build.conf.example` | Settings and secrets template for `~/.config/loop-build/config`. |
-| `com.loopbuild.auto.plist` | LaunchDaemon that runs `loop-build.sh auto` weekly with nobody logged in. |
-| `patches/` | Patches `loop-build.sh` applies before each build (see below). |
-| `com.github.actions-runner.loop.plist` | LaunchDaemon for a GitHub self-hosted runner (Option B only). |
-
-## Option A: fully local (recommended)
-
-`loop-build.sh` runs LoopKit's own fastlane lanes on the Mac, with no GitHub Actions.
-Certificates live in an encrypted fastlane match repo on the Mac, and Apple is reached
-with an App Store Connect API key, so it works over ssh with nobody logged in.
-Fetching code is the only thing that contacts GitHub.
-
-How the pieces fit:
+`loop-build.sh` builds Loop and uploads it to TestFlight on your Mac mini, over ssh,
+with nobody logged in at the screen. It runs LoopKit's own fastlane steps (the same
+ones the GitHub "Browser Build" uses) without GitHub Actions:
 
 - **What gets built:** LoopKit/LoopWorkspace, straight from LoopKit, so new LoopKit
   releases are picked up without syncing anything.
 - **Your changes:** this fork holds the script and `patches/`. The Mac keeps a clone
   of it at `~/loop-build-src` and pulls it before each build, so a patch you push
   here is built on the next scheduled run. Nothing on the fork's `main` is built.
-- **Certificates:** `~/loop-build/match-secrets.git` on the Mac, backed up to a
-  private repo on your local git server.
+- **Signing:** Apple is reached with an App Store Connect API key, so no Apple ID has
+  to be signed in to Xcode. The distribution certificate lives in an encrypted repo on
+  the Mac (`~/loop-build/match-secrets.git`), backed up to your local git server.
 
-### One-time setup
+| File | What it is |
+| --- | --- |
+| `loop-build.sh` | The build script. `loop-build.sh help` lists its commands. |
+| `loop-build.conf.example` | Settings template for `~/.config/loop-build/config`. |
+| `com.loopbuild.auto.plist` | Runs `loop-build.sh auto` every Sunday at 3:17 AM. |
+| `patches/` | Changes applied to LoopKit's code before each build. |
+| `com.github.actions-runner.loop.plist` | Only for the self-hosted runner option at the end. |
 
-1. Create a non-admin user (the files assume `loopbuilder`), run `brew install ruby`,
-   and install the Xcode version LoopKit's workflow uses at
-   `/Applications/Xcode_<version>.app`, with the iOS platform. Accept the license
-   and first launch once as an admin:
-   `sudo xcodebuild -license accept && sudo xcodebuild -runFirstLaunch`
-   (with `DEVELOPER_DIR` set to that Xcode if it isn't the selected one).
-2. As `loopbuilder`, clone this fork's branch and link the script into `~/loop-build`:
+## First build, step by step
+
+Do everything over ssh on the Mac mini, as the user that will run the builds. Your
+own account is fine. (A separate non-admin user is safer; if you make one, do every
+step as that user, except the `sudo` commands, which need an admin.)
+
+### 1. Check the clone and link the script
+
+```sh
+ls ~/loop-build-src/local-build/loop-build.sh
+```
+
+If that says "No such file", the clone is missing or on the wrong branch (the fork's
+`main` doesn't have this folder). Clone it again:
+
+```sh
+rm -rf ~/loop-build-src
+git clone --single-branch -b claude/loop-headless-mac-dexcom-share-s4f8jv \
+  https://github.com/backlog-bbq/LoopWorkspace.git ~/loop-build-src
+```
+
+Then link the script into `~/loop-build`, where it keeps everything it creates:
+
+```sh
+mkdir -p ~/loop-build && chmod 700 ~/loop-build
+ln -sf ~/loop-build-src/local-build/loop-build.sh ~/loop-build/loop-build.sh
+~/loop-build/loop-build.sh check
+```
+
+`check` lists what's still missing, with the command to fix each item. Run it again
+after each step below; you're done when it ends with "Ready for setup".
+
+### 2. Install Ruby
+
+fastlane needs Ruby 3 or newer; macOS's own Ruby is too old.
+
+```sh
+brew install ruby
+```
+
+The script finds Homebrew's Ruby on its own; you don't need to change your PATH.
+
+### 3. Get the right Xcode ready
+
+See which Xcode LoopKit builds with, and which ones you have:
+
+```sh
+grep -o 'Xcode_[0-9.]*' ~/loop-build-src/.github/workflows/build_loop.yml | head -1
+for x in /Applications/Xcode*.app; do echo "$x: $("$x/Contents/Developer/usr/bin/xcodebuild" -version | head -1)"; done
+```
+
+If one of yours is that version, you'll put its path in `XCODE_APP` in step 5. If
+not, install it, for example with `brew install xcodesorg/made/xcodes` and then
+`xcodes install <version>` (it asks for your Apple ID once, in the terminal).
+
+Then prepare it. Set `XB` to that Xcode's `xcodebuild`, for example:
+
+```sh
+XB=/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild
+sudo "$XB" -license accept
+sudo "$XB" -runFirstLaunch
+"$XB" -downloadPlatform iOS
+"$XB" -downloadPlatform watchOS
+```
+
+### 4. Collect your Apple details
+
+- **Team ID:** developer.apple.com > Account > Membership details. 10 characters.
+- **API key:** App Store Connect > Users and Access > Integrations > App Store Connect
+  API > Team Keys > "+". Give it any name and **Admin** access. Note the **Key ID**
+  and the **Issuer ID** shown above the list, and download the `.p8` file. Apple
+  lets you download it only once.
+
+Copy the key to the Mac, from the computer you downloaded it on:
+
+```sh
+ssh <mac-mini> 'mkdir -p ~/.config/loop-build'
+scp ~/Downloads/AuthKey_XXXXXXXXXX.p8 <mac-mini>:.config/loop-build/
+```
+
+### 5. Write the settings file
+
+```sh
+cp ~/loop-build-src/local-build/loop-build.conf.example ~/.config/loop-build/config
+chmod 600 ~/.config/loop-build/config ~/.config/loop-build/AuthKey_*.p8
+openssl rand -base64 30     # use this as MATCH_PASSWORD
+nano ~/.config/loop-build/config
+```
+
+Fill in `TEAMID`, `FASTLANE_KEY_ID`, `FASTLANE_ISSUER_ID`, `FASTLANE_KEY_PATH` (the
+real file name of your `.p8`) and `MATCH_PASSWORD`. Save `MATCH_PASSWORD` in your
+password manager: without it the certificate repo and its backup can't be opened.
+If you're using an Xcode that isn't at `/Applications/Xcode_<version>.app`, set
+`XCODE_APP`, for example `XCODE_APP="/Applications/Xcode.app"`. Leave `TOOLS_REPO`
+and `PATCH_DIR` as they are.
+
+### 6. Set up the certificate backup
+
+The certificate repo is the only copy of your distribution certificate, so back it up
+to your local git server before creating it:
+
+1. On the git server, create an **empty, private** repo, for example
+   `loop-match-backup`. Use it for nothing else: each backup overwrites it.
+2. On the Mac, make a key just for it and print the public half:
 
    ```sh
-   git clone --single-branch -b claude/loop-headless-mac-dexcom-share-s4f8jv \
-     https://github.com/backlog-bbq/LoopWorkspace.git ~/loop-build-src
-   mkdir -p ~/loop-build && chmod 700 ~/loop-build
-   ln -s ~/loop-build-src/local-build/loop-build.sh ~/loop-build/loop-build.sh
+   ssh-keygen -t ed25519 -N "" -C loop-match-backup -f ~/.ssh/loop_match_backup
+   cat ~/.ssh/loop_match_backup.pub
    ```
 
-   `~/loop-build` holds what the script creates (`LoopWorkspace/`, `bundle/`, `logs/`,
-   `state/`, `artifacts/`, `match-secrets.git/`); `~/loop-build-src` holds only what
-   you edit, and its submodules are never downloaded. If you later merge this branch
-   into another one, switch the clone to it (`git -C ~/loop-build-src switch <branch>`
-   after a fetch of that branch).
-3. Copy `loop-build.conf.example` to `~/.config/loop-build/config`, fill it in, and
-   `chmod 600` it and your `.p8` key file. Its `TOOLS_REPO` and `PATCH_DIR` lines
-   already point at `~/loop-build-src`.
-4. `~/loop-build/loop-build.sh setup` (add `--import-match <url>` to reuse an existing
-   Match-Secrets repo), then `~/loop-build/loop-build.sh build`.
-5. Install `com.loopbuild.auto.plist` (steps in the file) for a weekly check that
-   rebuilds when LoopKit changes or every 30 days.
+3. Add that public key to the repo as a deploy key **with write access**
+   (repo Settings > Deploy Keys on Gitea, Forgejo and GitLab).
+4. Copy the repo's ssh URL and connect once, to accept the server's host key
+   (answer "yes"; an error about no shell access is fine):
 
-### Back up the certificate repo
+   ```sh
+   ssh -i ~/.ssh/loop_match_backup -p <ssh-port> git@<git-server>
+   ```
 
-`~/loop-build/match-secrets.git` and `MATCH_PASSWORD` are the only copy of your
-distribution certificate. Create a dedicated, empty, private repo on your local git
-server and set `MATCH_BACKUP_URL` in the config to it. The script then
-runs `git push --mirror` to it after `setup`, after every successful certificate check
-during a build, after `nuke-certs`, and when you run `loop-build.sh backup`. It never
-pushes anywhere else. The repo stays encrypted with `MATCH_PASSWORD`.
+5. Add to `~/.config/loop-build/config`:
 
-Because the push also runs from launchd, it can't prompt for anything:
+   ```sh
+   MATCH_BACKUP_URL="ssh://git@<git-server>:<ssh-port>/<you>/loop-match-backup.git"
+   MATCH_BACKUP_SSH_KEY="~/.ssh/loop_match_backup"
+   ```
 
-- Over ssh: add a deploy key with write access to that repo, set
-  `MATCH_BACKUP_SSH_KEY` to its private key, and connect once by hand
-  (`ssh -i <key> -p <port> git@<forge>`) so the server's host key is known.
-- Over https: store a token in git's credential helper for the `loopbuilder` user.
+Run `~/loop-build/loop-build.sh check` now. Fix anything marked TODO until it says
+"Ready for setup".
 
-A failed backup stops `setup` and `nuke-certs` (so you notice), but only sends a
-`warning` notification during a scheduled build.
+### 7. Run setup (once)
 
-### Patches
+```sh
+~/loop-build/loop-build.sh setup
+```
+
+This downloads LoopWorkspace and its submodules into `~/loop-build/LoopWorkspace`,
+installs fastlane, registers Loop's identifiers with Apple, creates a distribution
+certificate and profiles in the certificate repo, and backs it up. The first run
+takes a while. It ends with "Setup complete".
+
+### 8. Check the app exists in App Store Connect
+
+Open App Store Connect > Apps. If you uploaded Loop to TestFlight before with this
+team, it's there already. If not: "+" > New App, platform iOS, any name nobody else
+on the App Store uses, bundle ID `com.<TEAMID>.loopkit.Loop` (setup just registered
+it), any SKU, Full Access.
+
+### 9. Build and upload
+
+A build can take well over half an hour. Start it so it survives the ssh session
+ending and the Mac idling to sleep, then watch the log:
+
+```sh
+nohup caffeinate -i ~/loop-build/loop-build.sh build >/dev/null 2>&1 &
+sleep 2; tail -f "$(ls -t ~/loop-build/logs/*.log | head -1)"
+```
+
+(Ctrl-C stops watching, not the build.) It finishes with "Done. Loop was uploaded to
+TestFlight". After Apple processes it, usually within half an hour, it appears in
+App Store Connect > TestFlight and in the TestFlight app on your phone. The build
+number continues from your last TestFlight upload. The IPA and build log are also
+kept in `~/loop-build/artifacts/`.
+
+### 10. Turn on the weekly schedule
+
+The schedule file assumes a user called `loopbuilder`; this installs it for you:
+
+```sh
+sed "s#loopbuilder#$(whoami)#g" ~/loop-build-src/local-build/com.loopbuild.auto.plist > /tmp/com.loopbuild.auto.plist
+sudo install -o root -g wheel -m 644 /tmp/com.loopbuild.auto.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.loopbuild.auto.plist
+```
+
+Every Sunday at 3:17 AM it pulls your fork, checks LoopKit, and builds only if
+LoopKit or your patches changed, or the last build is 30 days old (TestFlight builds
+expire after 90). To test it right away: `sudo launchctl kickstart system/com.loopbuild.auto`.
+`~/loop-build/loop-build.sh status` shows the last build. To get a message when a
+build finishes or fails, set `NOTIFY_CMD` in the config.
+
+## When something fails
+
+Each run writes a log to `~/loop-build/logs/`; the last lines say what went wrong.
+
+| Message | What to do |
+| --- | --- |
+| `Xcode not found at ...` | Set `XCODE_APP` in the config (step 3). LoopKit sometimes moves to a newer Xcode; install it when that happens. |
+| `The iOS platform isn't installed` | Run the `-downloadPlatform` commands in step 3. |
+| `... is readable by other users` | Run the `chmod 600` command it prints. |
+| `fastlane certs failed` / too many certificates | Revoke an unused distribution certificate at developer.apple.com > Certificates, then run `build` again. |
+| `distribution certificate is missing or expired` | Run `~/loop-build/loop-build.sh nuke-certs` in a terminal, then `build`. Existing TestFlight builds keep working. |
+| Can't find the app / `latest_testflight_build_number` fails | Create the app in App Store Connect (step 8). |
+| `Couldn't push the certificate repo` | Check `MATCH_BACKUP_URL`, the deploy key's write access, and that you connected once by hand (step 6). `loop-build.sh backup` retries. |
+| `git apply` error on a patch | LoopKit changed the code the patch touches. Update or remove the patch in `local-build/patches/` and push. |
+| `Another loop-build run is in progress` | A build is still running; see it with `pgrep -fl loop-build`. |
+
+## Patches
 
 `loop-build.sh` applies `PATCH_DIR/*.patch` to LoopWorkspace and
 `PATCH_DIR/<Submodule>/*.patch` inside that submodule, after resetting everything a
