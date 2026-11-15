@@ -15,7 +15,7 @@ jobs:
   identifiers:
     name: Add Identifiers
     needs: validate
-    runs-on: xcode-27
+    runs-on: ${{ vars.MAC_RUNNER || 'xcode-27' }}
     steps:
       # Checks-out the repo
       - name: Checkout Repo
@@ -38,6 +38,7 @@ jobs:
 
       # Sync the GitHub runner clock with the Windows time server (workaround as suggested in https://github.com/actions/runner/issues/2996)
       - name: Sync clock
+        if: runner.environment == 'github-hosted'
         run: sudo sntp -sS time.windows.com
       
       # Create or update identifiers for app
@@ -50,3 +51,13 @@ jobs:
           FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
           FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
           FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
+
+      # Self-hosted only: fastlane setup_ci makes a temporary keychain holding your
+      # distribution certificate and sets it as the default. Remove it after the job.
+      - name: Remove temporary keychain (self-hosted)
+        if: always() && runner.environment == 'self-hosted'
+        run: |
+          security delete-keychain fastlane_tmp_keychain 2>/dev/null || true
+          if [ -f "$HOME/Library/Keychains/login.keychain-db" ]; then
+            security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" || true
+          fi

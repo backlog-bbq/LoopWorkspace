@@ -162,7 +162,7 @@ jobs:
   build:
     name: Build
     needs: [check_certs, check_status]
-    runs-on: xcode-27
+    runs-on: ${{ vars.MAC_RUNNER || 'xcode-27' }}
     permissions:
       contents: write
     if:
@@ -172,7 +172,21 @@ jobs:
         (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
     steps:
       - name: Select Xcode version
+        if: runner.environment == 'github-hosted'
         run: "sudo xcode-select --switch /Applications/Xcode_27.1.app/Contents/Developer"
+
+      # Self-hosted: use DEVELOPER_DIR instead of sudo xcode-select (no sudo needed).
+      # Install the matching Xcode at this path, or set the SELF_HOSTED_XCODE variable.
+      - name: Select Xcode version (self-hosted)
+        if: runner.environment == 'self-hosted'
+        run: |
+          XCODE_APP="${{ vars.SELF_HOSTED_XCODE || '/Applications/Xcode_27.1.app' }}"
+          if [ ! -d "$XCODE_APP/Contents/Developer" ]; then
+            echo "::error::Xcode not found at $XCODE_APP. Install it there or set the SELF_HOSTED_XCODE repository variable."
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$XCODE_APP/Contents/Developer" xcodebuild -version
 
       - name: Checkout Repo for building
         uses: actions/checkout@v5
@@ -225,6 +239,7 @@ jobs:
 
       # Sync the GitHub runner clock with the Windows time server (workaround as suggested in https://github.com/actions/runner/issues/2996)
       - name: Sync clock
+        if: runner.environment == 'github-hosted'
         run: sudo sntp -sS time.windows.com
 
       # Build signed Loop IPA file
@@ -258,3 +273,13 @@ jobs:
           path: |
             artifacts
             buildlog
+
+      # Self-hosted only: fastlane setup_ci makes a temporary keychain holding your
+      # distribution certificate and sets it as the default. Remove it after the job.
+      - name: Remove temporary keychain (self-hosted)
+        if: always() && runner.environment == 'self-hosted'
+        run: |
+          security delete-keychain fastlane_tmp_keychain 2>/dev/null || true
+          if [ -f "$HOME/Library/Keychains/login.keychain-db" ]; then
+            security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" || true
+          fi

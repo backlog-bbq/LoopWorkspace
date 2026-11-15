@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs "loop-build.sh auto" every Sunday at 3:17 AM as the "loopbuilder" user,
+  with nobody logged in. 'auto' only builds when LoopKit or your patches changed,
+  or the last build is older than REBUILD_DAYS (30 by default).
+  If the Mac is asleep at that time, launchd runs it when the Mac wakes.
+
+  Assumes user "loopbuilder" with the script at /Users/loopbuilder/loop-build/loop-build.sh.
+  Change UserName and the paths if yours differ.
+
+  Install:
+    sudo cp com.loopbuild.auto.plist /Library/LaunchDaemons/
+    sudo chown root:wheel /Library/LaunchDaemons/com.loopbuild.auto.plist
+    sudo chmod 644 /Library/LaunchDaemons/com.loopbuild.auto.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.loopbuild.auto.plist
+
+  Run it now (to test):  sudo launchctl kickstart system/com.loopbuild.auto
+  Check:                 sudo launchctl print system/com.loopbuild.auto
+  Remove:                sudo launchctl bootout system/com.loopbuild.auto
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.loopbuild.auto</string>
+
+    <key>UserName</key>
+    <string>loopbuilder</string>
+    <key>GroupName</key>
+    <string>staff</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/loopbuilder/loop-build/loop-build.sh</string>
+        <string>auto</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/loopbuilder</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>17</integer>
+    </dict>
+
+    <!-- Own security session so fastlane can create and unlock its temporary keychain. -->
+    <key>SessionCreate</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/loopbuilder</string>
+    </dict>
+
+    <!-- The script writes its own detailed log in ~/loop-build/logs; this catches
+         anything that happens before that log starts. -->
+    <key>StandardOutPath</key>
+    <string>/Users/loopbuilder/loop-build/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/loopbuilder/loop-build/launchd.log</string>
+</dict>
+</plist>

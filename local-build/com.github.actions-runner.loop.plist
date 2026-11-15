@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Starts the GitHub Actions runner at boot on a headless Mac, with no login.
+  (GitHub's ./svc.sh installs a LaunchAgent, which only runs while the user
+  is logged in at the screen.)
+
+  Assumes a dedicated, non-admin user "loopbuilder" with the runner in
+  /Users/loopbuilder/actions-runner. Change both if yours differ.
+
+  Install:
+    sudo cp com.github.actions-runner.loop.plist /Library/LaunchDaemons/
+    sudo chown root:wheel /Library/LaunchDaemons/com.github.actions-runner.loop.plist
+    sudo chmod 644 /Library/LaunchDaemons/com.github.actions-runner.loop.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.actions-runner.loop.plist
+
+  Check:   sudo launchctl print system/com.github.actions-runner.loop
+  Remove:  sudo launchctl bootout system/com.github.actions-runner.loop
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.actions-runner.loop</string>
+
+    <key>UserName</key>
+    <string>loopbuilder</string>
+    <key>GroupName</key>
+    <string>staff</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/loopbuilder/actions-runner/run.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/loopbuilder/actions-runner</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Gives the job its own security session so fastlane can create and
+         unlock its temporary keychain without a GUI login. -->
+    <key>SessionCreate</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/loopbuilder</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/opt/ruby/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- fastlane needs a UTF-8 locale -->
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/loopbuilder/actions-runner/_diag/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/loopbuilder/actions-runner/_diag/launchd.err.log</string>
+</dict>
+</plist>
