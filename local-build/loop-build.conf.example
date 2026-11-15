@@ -29,6 +29,15 @@ MATCH_PASSWORD="change-me"
 # to the fork is built on the next scheduled run.
 TOOLS_REPO="~/loop-build-src"
 
+# Apps to build, any of: loop caregiver follow xdrip
+# (Loop, LoopCaregiver, LoopFollow, xDrip4iOS). They share one distribution
+# certificate. After adding an app, run install.sh (or 'loop-build.sh setup <app>')
+# once to register it, and create its app in App Store Connect.
+APPS="loop"
+
+# Per-app overrides: <APP>_REPO, <APP>_BRANCH, <APP>_PATCH_DIR, <APP>_XCODE_APP.
+# Examples: FOLLOW_BRANCH="dev"   CAREGIVER_XCODE_APP="/Applications/Xcode_26.5.app"
+
 # Folder of patches to apply before each build. *.patch applies to LoopWorkspace,
 # <Submodule>/*.patch inside that submodule. Default: ~/loop-build/patches.
 PATCH_DIR="~/loop-build-src/local-build/patches"

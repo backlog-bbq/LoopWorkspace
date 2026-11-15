@@ -109,6 +109,21 @@ then run this script again."
 }
 pause() { printf '   %s Press Return when done. ' "$*"; IFS= read -r _ || true; }
 
+ALL_APPS="loop caregiver follow xdrip"
+app_label() { # app_label APP -> "Loop|com.TEAMID.loopkit.Loop"
+  case "$1" in
+    loop)      echo "Loop|com.$TEAMID.loopkit.Loop" ;;
+    caregiver) echo "LoopCaregiver|com.$TEAMID.loopkit.LoopCaregiver" ;;
+    follow)    echo "LoopFollow|com.$TEAMID.LoopFollow" ;;
+    xdrip)     echo "xDrip4iOS|com.$TEAMID.xdripswift" ;;
+  esac
+}
+# Has 'loop-build.sh setup' registered this app? (Older setups kept Loop's state in state/.)
+app_set_up() {
+  [ -f "$BASE/state/$1/identifiers_done" ] && return 0
+  [ "$1" = loop ] && [ ! -d "$BASE/state/loop" ] && [ -f "$BASE/state/setup_complete" ]
+}
+
 file_owner() { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1"; }
 
 version_ge() { # version_ge 3.3.6 3.0
@@ -417,7 +432,7 @@ echo "Settings go in $CONFIG; builds happen in $BASE."
 
 # Earlier answers become defaults.
 TEAMID="" FASTLANE_KEY_ID="" FASTLANE_ISSUER_ID="" FASTLANE_KEY_PATH="" MATCH_PASSWORD=""
-XCODE_APP="" MATCH_BACKUP_URL="" MATCH_BACKUP_SSH_KEY=""
+XCODE_APP="" MATCH_BACKUP_URL="" MATCH_BACKUP_SSH_KEY="" APPS=""
 if [ -f "$CONFIG" ]; then
   # shellcheck source=/dev/null
   . "$CONFIG"
@@ -497,6 +512,21 @@ while :; do
   warn "That should be 10 letters and digits."
   TEAMID=""
 done
+
+# ---------------------------------------------------------------------------
+step "Apps to build"
+info "loop = Loop, caregiver = LoopCaregiver, follow = LoopFollow, xdrip = xDrip4iOS."
+info "They all share one distribution certificate. You can change this later."
+while :; do
+  ask APPS "Apps, separated by spaces" "${APPS:-loop}"
+  APPS="$(printf '%s' "$APPS" | tr '[:upper:],' '[:lower:] ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+  bad=""
+  for a in $APPS; do case " $ALL_APPS " in *" $a "*) ;; *) bad="$bad $a" ;; esac; done
+  [ -n "$APPS" ] && [ -z "$bad" ] && break
+  warn "Unknown:${bad:- (none given)}. Choose from: $ALL_APPS"
+  APPS=""
+done
+ok "Building: $APPS"
 
 # ---------------------------------------------------------------------------
 step "App Store Connect API key"
@@ -666,6 +696,7 @@ set_conf MATCH_PASSWORD "$MATCH_PASSWORD"
 set_conf TOOLS_REPO "$TOOLS_DIR"
 set_conf PATCH_DIR "$HERE/patches"
 set_conf XCODE_APP "$XCODE_APP"
+set_conf APPS "$APPS"
 set_conf MATCH_BACKUP_URL "$MATCH_BACKUP_URL"
 set_conf MATCH_BACKUP_SSH_KEY "$BACKUP_KEY"
 chmod 600 "$CONFIG"
@@ -678,27 +709,38 @@ if ! "$LB" check; then
 fi
 
 # ---------------------------------------------------------------------------
-step "Register Loop with Apple and create certificates"
-if [ -f "$BASE/state/setup_complete" ]; then
+step "Register the apps with Apple and create certificates"
+todo_apps=""
+for a in $APPS; do app_set_up "$a" || todo_apps="$todo_apps $a"; done
+todo_apps="${todo_apps# }"
+if [ -f "$BASE/state/setup_complete" ] && [ -z "$todo_apps" ]; then
   ok "Already done."
 else
-  info "This downloads LoopWorkspace (~22 repos), installs fastlane, registers Loop's"
-  info "identifiers and creates your distribution certificate. It takes a while."
+  info "This downloads each app's code (Loop's alone is ~22 repos), installs fastlane,"
+  info "registers the apps' identifiers and creates your distribution certificate."
+  info "It takes a while."
   if [ -n "$IMPORT_URL" ]; then
-    "$LB" setup --import-match "$IMPORT_URL"
+    # shellcheck disable=SC2086
+    "$LB" setup --import-match "$IMPORT_URL" ${todo_apps:-$APPS}
   else
-    "$LB" setup
+    # shellcheck disable=SC2086
+    "$LB" setup ${todo_apps:-$APPS}
   fi
 fi
 
 # ---------------------------------------------------------------------------
-step "Loop in App Store Connect"
-info "TestFlight uploads need a Loop app in App Store Connect > Apps with bundle ID"
-info "com.$TEAMID.loopkit.Loop. If you've uploaded Loop to TestFlight with this team before, it's there."
-if ! yesno "Is it there?" y; then
-  info "Create it: App Store Connect > Apps > '+' > New App. Platform iOS, any name nobody"
-  info "else on the App Store uses, bundle ID com.$TEAMID.loopkit.Loop, any SKU, Full Access."
-  pause "Created it?"
+step "The apps in App Store Connect"
+info "TestFlight uploads need an app in App Store Connect > Apps for each of these"
+info "bundle IDs. One you've uploaded to TestFlight with this team before is there already."
+for a in $APPS; do
+  l="$(app_label "$a")"
+  info "  ${l%%|*}: ${l#*|}"
+done
+if ! yesno "Are they all there?" y; then
+  info "For each missing one: App Store Connect > Apps > '+' > New App. Platform iOS,"
+  info "any name nobody else on the App Store uses, the bundle ID above, any SKU,"
+  info "Full Access."
+  pause "Created them?"
 fi
 
 # ---------------------------------------------------------------------------
@@ -709,7 +751,7 @@ install_schedule "$(whoami)" "$HOME"
 step "First build"
 info "A build can take well over half an hour. It runs in the background, so closing"
 info "this ssh session doesn't stop it, and keeps the Mac awake until it's done."
-if yesno "Build Loop and upload it to TestFlight now?" y; then
+if yesno "Build and upload now ($APPS)?" y; then
   nohup caffeinate -i "$LB" build >/dev/null 2>&1 &
   pid=$! latest="" i=0
   # Wait for the build's own log to appear (logs are named ...-build.log).
@@ -726,8 +768,8 @@ if yesno "Build Loop and upload it to TestFlight now?" y; then
     die "The build didn't start. Run it by hand to see why: $LB build"
   fi
   ok "Started. Log: $latest"
-  info "It ends with \"Done. Loop was uploaded to TestFlight\". After Apple processes it,"
-  info "it shows up in the TestFlight app. '$LB status' shows how the last build went."
+  info "Each app ends with \"Done. <app> was uploaded to TestFlight\". After Apple processes"
+  info "it, it shows up in the TestFlight app. '$LB status' shows how the last builds went."
   if [ -n "$latest" ] && yesno "Watch the log now? (Ctrl-C stops watching, not the build)" y; then
     exec tail -f "$latest"
   fi

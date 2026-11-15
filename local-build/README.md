@@ -310,6 +310,35 @@ Each run writes a log to `~/loop-build/logs/`; the last lines say what went wron
 | `git apply` error on a patch | LoopKit changed the code the patch touches. Update or remove the patch in `local-build/patches/` and push. |
 | `Another loop-build run is in progress` | A build is still running; see it with `pgrep -fl loop-build`. |
 
+## Other apps: LoopCaregiver, LoopFollow, xDrip4iOS
+
+The same script builds these too. Set `APPS` in the settings file (or answer
+`install.sh`'s question), for example `APPS="loop caregiver follow xdrip"`.
+
+| `APPS` name | App | Source (branch) | Bundle ID in App Store Connect |
+| --- | --- | --- | --- |
+| `loop` | Loop | LoopKit/LoopWorkspace (`main`) | `com.<TEAMID>.loopkit.Loop` |
+| `caregiver` | LoopCaregiver | LoopKit/LoopCaregiver (`dev`) | `com.<TEAMID>.loopkit.LoopCaregiver` |
+| `follow` | LoopFollow | loopandlearn/LoopFollow (`main`) | `com.<TEAMID>.LoopFollow` |
+| `xdrip` | xDrip4iOS | JohanDegraeve/xdripswift (`master`) | `com.<TEAMID>.xdripswift` |
+
+- All four use the same certificate repo, so one distribution certificate signs them all.
+- After adding an app, run `install.sh` again (or `loop-build.sh setup <app>`): it
+  registers the app's identifiers with Apple. Then create its app in App Store Connect
+  with the bundle ID above, before its first upload.
+- Each app has its own source folder in `~/loop-build`, build history and artifacts.
+  `auto` decides per app whether to build, and one app failing doesn't stop the others;
+  the notification names the ones that failed.
+- Build some apps only: `loop-build.sh build follow xdrip`.
+- Patches for an app go in `local-build/patches-<app>/` (for example
+  `patches-follow/`), applied to that app's repository.
+- Override an app's source with `<APP>_REPO` and `<APP>_BRANCH`, for example
+  `FOLLOW_BRANCH="dev"`.
+- Xcode: LoopCaregiver's and xDrip4iOS's workflows still name Xcode 26.x. They're built
+  with your `XCODE_APP` (a newer Xcode) and the log notes the difference. If one fails to
+  compile, install the version its workflow names and point `CAREGIVER_XCODE_APP` or
+  `XDRIP_XCODE_APP` at it.
+
 ## Patches
 
 `loop-build.sh` applies `PATCH_DIR/*.patch` to LoopWorkspace and

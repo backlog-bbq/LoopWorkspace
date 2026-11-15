@@ -1,10 +1,12 @@
 #!/bin/bash
 #
-# loop-build.sh - build Loop and upload it to TestFlight entirely on this Mac.
+# loop-build.sh - build Loop (and LoopCaregiver, LoopFollow, xDrip4iOS) and upload
+# them to TestFlight entirely on this Mac.
 #
-# Uses LoopKit's own fastlane setup (the same lanes the GitHub "Browser Build"
+# Uses each app's own fastlane setup (the same lanes the GitHub "Browser Build"
 # runs), with no GitHub Actions and no GitHub-hosted certificates:
-#   * Source code is pulled from GitHub (LoopKit/LoopWorkspace by default).
+#   * Source code is pulled from GitHub (LoopKit/LoopWorkspace etc.). APPS in the
+#     config picks the apps: loop caregiver follow xdrip.
 #   * Signing certificates live in a local, encrypted fastlane match repo
 #     ($LOOP_BUILD_HOME/match-secrets.git), not in a GitHub Match-Secrets repo.
 #     Set MATCH_BACKUP_URL to mirror it to a private repo on your own git server.
@@ -15,13 +17,15 @@
 #
 # Commands:
 #   check                       List what still needs doing before setup/build.
-#   setup [--import-match URL]  One-time: create the local match repo (or copy an
+#   setup [--import-match URL] [APP...]
+#                               One-time: create the local match repo (or copy an
 #                               existing Match-Secrets repo), register identifiers,
-#                               create or download certificates.
-#   auto                        For the schedule: build only if LoopKit changed,
-#                               your patches changed, or the last build is older
+#                               create or download certificates. Run again after
+#                               adding apps to APPS.
+#   auto [APP...]               For the schedule: build each app only if its code
+#                               or your patches changed, or its last build is older
 #                               than REBUILD_DAYS.
-#   build                       Build and upload now.
+#   build [APP...]              Build and upload now. Without APP: every app in APPS.
 #   status                      Show the last build and what is installed.
 #   backup                      Mirror the certificate repo to MATCH_BACKUP_URL now.
 #   nuke-certs                  Revoke all distribution certificates for the team
@@ -29,8 +33,9 @@
 #
 # Files (LOOP_BUILD_HOME defaults to ~/loop-build):
 #   ~/.config/loop-build/config   Settings and secrets (chmod 600). See loop-build.conf.example.
-#   $LOOP_BUILD_HOME/patches/     Optional customizations (or set PATCH_DIR): *.patch applies to
-#                                 LoopWorkspace, <Submodule>/*.patch applies inside that submodule.
+#   $LOOP_BUILD_HOME/patches/     Optional customizations for Loop (or set PATCH_DIR): *.patch applies
+#                                 to LoopWorkspace, <Submodule>/*.patch inside that submodule.
+#   <PATCH_DIR>-<app>/            The same for the other apps, e.g. patches-caregiver/.
 #   TOOLS_REPO (optional)         A clone of the repo that holds this script and your patches.
 #                                 It is updated (git pull --ff-only) before each build.
 #   $LOOP_BUILD_HOME/logs/        One log per run.
@@ -66,6 +71,69 @@ LOCK_DIR="$BASE/.lock"
 # Git is told to rewrite that URL to the local repo, so LoopKit's files stay untouched.
 MATCH_OWNER="local-match"
 MATCH_FAKE_URL="https://github.com/$MATCH_OWNER/Match-Secrets.git"
+
+# The apps this script knows. All use the same fastlane setup and the same
+# Match-Secrets repo, so one distribution certificate signs all of them.
+ALL_APPS="loop caregiver follow xdrip"
+APP="" APP_NAME="" APP_REPO="" APP_BRANCH="" APP_WORKFLOW="" APP_BUNDLE="" APP_PATCH_DIR="" APP_STATE=""
+LANE_IDS="" LANE_BUILD="" LANE_RELEASE="" LANE_RENEW="" APP_XCODE=""
+FAILED_APPS=""
+
+# app_def APP: set SRC, APP_* and LANE_* for one app. <APP>_REPO, <APP>_BRANCH,
+# <APP>_PATCH_DIR and <APP>_XCODE_APP in the config override the defaults
+# (e.g. LOOP_REPO, CAREGIVER_BRANCH).
+app_def() {
+  local up repo branch dir
+  APP="$1"
+  case "$1" in
+    loop)      APP_NAME=Loop;        repo=https://github.com/LoopKit/LoopWorkspace.git;      branch=main
+               dir=LoopWorkspace;    APP_WORKFLOW=build_loop.yml
+               LANE_IDS=identifiers; LANE_BUILD=build_loop; LANE_RELEASE=release
+               LANE_RENEW=check_and_renew_certificates; APP_BUNDLE="com.${TEAMID:-TEAMID}.loopkit.Loop" ;;
+    caregiver) APP_NAME=LoopCaregiver; repo=https://github.com/LoopKit/LoopCaregiver.git;    branch=dev
+               dir=LoopCaregiver;    APP_WORKFLOW=build_loopcaregiver.yml
+               LANE_IDS=caregiver_identifier; LANE_BUILD=caregiver_build; LANE_RELEASE=caregiver_release
+               LANE_RENEW=check_and_renew_certificates; APP_BUNDLE="com.${TEAMID:-TEAMID}.loopkit.LoopCaregiver" ;;
+    follow)    APP_NAME=LoopFollow;  repo=https://github.com/loopandlearn/LoopFollow.git;  branch=main
+               dir=LoopFollow;       APP_WORKFLOW=build_LoopFollow.yml
+               LANE_IDS=identifiers; LANE_BUILD=build_LoopFollow; LANE_RELEASE=release
+               LANE_RENEW=check_and_renew_certificates; APP_BUNDLE="com.${TEAMID:-TEAMID}.LoopFollow" ;;
+    xdrip)     APP_NAME=xDrip4iOS;   repo=https://github.com/JohanDegraeve/xdripswift.git; branch=master
+               dir=xdripswift;       APP_WORKFLOW=build_xdrip.yml
+               LANE_IDS=identifiers; LANE_BUILD=build_xdrip4ios; LANE_RELEASE=release
+               LANE_RENEW="";        APP_BUNDLE="com.${TEAMID:-TEAMID}.xdripswift" ;;
+    *) die "Unknown app '$1'. Known apps: $ALL_APPS" ;;
+  esac
+  up="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  eval "APP_REPO=\"\${${up}_REPO:-$repo}\""
+  eval "APP_BRANCH=\"\${${up}_BRANCH:-$branch}\""
+  eval "APP_XCODE=\"\${${up}_XCODE_APP:-\${XCODE_APP:-}}\""
+  if [ "$1" = loop ]; then
+    APP_PATCH_DIR="$PATCH_DIR"
+  else
+    eval "APP_PATCH_DIR=\"\${${up}_PATCH_DIR:-${PATCH_DIR%/}-$1}\""
+  fi
+  APP_PATCH_DIR="${APP_PATCH_DIR/#\~/$HOME}"
+  SRC="$BASE/$dir"
+  APP_STATE="$STATE_DIR/$1"
+}
+
+# Before other apps were supported, Loop's build history lived directly in state/.
+migrate_state() {
+  local d f has_app_dirs=0
+  # Loop's earlier build files sat directly in artifacts/.
+  for d in "$ARTIFACT_DIR"/20*/; do
+    [ -d "$d" ] || continue
+    mkdir -p "$ARTIFACT_DIR/loop"
+    mv "$d" "$ARTIFACT_DIR/loop/"
+  done
+  for d in "$STATE_DIR"/*/; do [ -d "$d" ] && has_app_dirs=1; done
+  [ "$has_app_dirs" = 0 ] || return 0
+  [ -f "$STATE_DIR/last_success_key" ] || [ -f "$STATE_DIR/setup_complete" ] || return 0
+  mkdir -p "$STATE_DIR/loop"
+  for f in "$STATE_DIR"/last_success_*; do [ -e "$f" ] && mv "$f" "$STATE_DIR/loop/"; done
+  if [ -f "$STATE_DIR/setup_complete" ]; then date +%s > "$STATE_DIR/loop/identifiers_done"; fi
+}
 
 # launchd and ssh start with a minimal PATH. Use the private Ruby install.sh builds
 # in $BASE/ruby; otherwise a Homebrew Ruby if there is one (macOS's own is too old).
@@ -119,8 +187,9 @@ load_config() {
   [ -f "$FASTLANE_KEY_PATH" ] || die "API key file not found: $FASTLANE_KEY_PATH"
   check_private "$FASTLANE_KEY_PATH"
 
-  LOOP_REPO="${LOOP_REPO:-https://github.com/LoopKit/LoopWorkspace.git}"
-  LOOP_BRANCH="${LOOP_BRANCH:-main}"
+  APPS="${APPS:-loop}"
+  local a
+  for a in $APPS; do app_def "$a"; done   # stops here on an unknown app name
   XCODE_APP="${XCODE_APP:-}"
   PATCH_DIR="${PATCH_DIR/#\~/$HOME}"
   TOOLS_REPO="${TOOLS_REPO:-}"
@@ -175,21 +244,29 @@ notify() {
     /bin/sh -c "$NOTIFY_CMD" || log "Notification command failed."
 }
 
+# fastlane's setup_ci leaves a temporary keychain holding the distribution
+# private key and makes it the default. Remove it after every app and run.
+cleanup_keychain() {
+  command -v security >/dev/null 2>&1 || return 0
+  security delete-keychain fastlane_tmp_keychain >/dev/null 2>&1 || true
+  if [ -f "$HOME/Library/Keychains/login.keychain-db" ]; then
+    security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
+  fi
+}
+
 on_exit() {
   local rc=$?
   set +e
-  # fastlane's setup_ci leaves a temporary keychain holding the distribution
-  # private key and makes it the default. Remove it after every run.
-  if command -v security >/dev/null 2>&1; then
-    security delete-keychain fastlane_tmp_keychain >/dev/null 2>&1
-    if [ -f "$HOME/Library/Keychains/login.keychain-db" ]; then
-      security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1
-    fi
-  fi
+  cleanup_keychain
   if [ "$HAVE_LOCK" = 1 ]; then rm -rf "$LOCK_DIR"; fi
   if [ $rc -ne 0 ] && [ -n "$LOG_FILE" ]; then
-    log "Failed (exit $rc). Log: $LOG_FILE"
-    notify failure "Loop build failed. Log: $LOG_FILE"
+    if [ -n "$FAILED_APPS" ]; then
+      log "Failed: $FAILED_APPS. Log: $LOG_FILE"
+      notify failure "Build failed for $FAILED_APPS. Log: $LOG_FILE"
+    else
+      log "Failed (exit $rc). Log: $LOG_FILE"
+      notify failure "loop-build failed. Log: $LOG_FILE"
+    fi
   fi
   exit $rc
 }
@@ -244,28 +321,28 @@ update_tools() {
 # (fastlane edits the Xcode project in place; patches modify files).
 update_source() {
   if [ ! -d "$SRC/.git" ]; then
-    log "Cloning $(redact_url "$LOOP_REPO") ($LOOP_BRANCH)"
-    git clone --branch "$LOOP_BRANCH" --recurse-submodules "$LOOP_REPO" "$SRC"
+    log "Cloning $APP_NAME from $(redact_url "$APP_REPO") ($APP_BRANCH)"
+    git clone --branch "$APP_BRANCH" --recurse-submodules "$APP_REPO" "$SRC"
   else
-    log "Fetching $(redact_url "$LOOP_REPO") ($LOOP_BRANCH)"
-    git -C "$SRC" remote set-url origin "$LOOP_REPO"
-    git -C "$SRC" fetch --prune origin "$LOOP_BRANCH"
-    git -C "$SRC" checkout -q -B "$LOOP_BRANCH" "origin/$LOOP_BRANCH"
-    git -C "$SRC" reset -q --hard "origin/$LOOP_BRANCH"
+    log "Fetching $APP_NAME from $(redact_url "$APP_REPO") ($APP_BRANCH)"
+    git -C "$SRC" remote set-url origin "$APP_REPO"
+    git -C "$SRC" fetch --prune origin "$APP_BRANCH"
+    git -C "$SRC" checkout -q -B "$APP_BRANCH" "origin/$APP_BRANCH"
+    git -C "$SRC" reset -q --hard "origin/$APP_BRANCH"
   fi
   git -C "$SRC" submodule sync -q --recursive
   git -C "$SRC" submodule update -q --init --recursive --force
   git -C "$SRC" clean -ffdxq
   git -C "$SRC" submodule foreach -q --recursive 'git reset -q --hard && git clean -ffdxq'
-  log "LoopWorkspace at $(git -C "$SRC" log -1 --format='%h %s (%cd)' --date=short)"
+  log "$APP_NAME at $(git -C "$SRC" log -1 --format='%h %s (%cd)' --date=short)"
 }
 
-# Identifies what would be built: the LoopWorkspace commit plus your patches.
+# Identifies what would be built: the app's commit plus your patches for it.
 state_key() {
   local head patches=none
   head="$(git -C "$SRC" rev-parse HEAD)"
-  if [ -d "$PATCH_DIR" ]; then
-    patches="$(cd "$PATCH_DIR" && find . -type f -name '*.patch' -print0 | LC_ALL=C sort -z \
+  if [ -d "$APP_PATCH_DIR" ]; then
+    patches="$(cd "$APP_PATCH_DIR" && find . -type f -name '*.patch' -print0 | LC_ALL=C sort -z \
       | xargs -0 cat 2>/dev/null | shasum -a 256 | cut -c1-16)"
   fi
   echo "$head-$patches"
@@ -277,19 +354,19 @@ xcode_version() { # xcode_version /Applications/Xcode.app -> 27.1
 }
 
 select_xcode() {
-  local app="$XCODE_APP" want wantv havev
-  want="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$SRC/.github/workflows/build_loop.yml" 2>/dev/null | head -n 1 || true)"
+  local app="$APP_XCODE" want wantv havev
+  want="$(grep -oE '/Applications/Xcode[^/"]*\.app' "$SRC/.github/workflows/$APP_WORKFLOW" 2>/dev/null | head -n 1 || true)"
   if [ -z "$app" ]; then
     app="$want"
-    [ -n "$app" ] || die "Couldn't read which Xcode LoopKit uses. Set XCODE_APP in the config."
-    log "LoopKit currently builds with $app"
+    [ -n "$app" ] || die "Couldn't read which Xcode $APP_NAME uses. Set XCODE_APP in the config."
+    log "$APP_NAME's workflow builds with $app"
   elif [ -n "$want" ] && [ -d "$app" ]; then
     wantv="$(printf '%s' "$want" | sed -E 's#.*/Xcode_?([0-9.]*)\.app#\1#')"
     havev="$(xcode_version "$app" || true)"
     # A newer Xcode in the same major series is fine; warn about older or other majors.
     if [ -n "$havev" ] && [ -n "$wantv" ] \
        && { [ "${havev%%.*}" != "${wantv%%.*}" ] || ! version_ge "$havev" "$wantv"; }; then
-      log "WARNING: LoopKit now builds with Xcode $wantv, but XCODE_APP is Xcode $havev ($app). If the build fails, install Xcode $wantv (run install.sh again) or update XCODE_APP."
+      log "WARNING: $APP_NAME's workflow builds with Xcode $wantv, but this uses Xcode $havev ($app). If the build fails, install Xcode $wantv and set XCODE_APP (or $(printf '%s' "$APP" | tr '[:lower:]' '[:upper:]')_XCODE_APP) to it."
     fi
   fi
   [ -d "$app/Contents/Developer" ] || die "Xcode not found at $app. Install that version at that path (for example with 'xcodes'), or set XCODE_APP in the config."
@@ -300,17 +377,17 @@ select_xcode() {
 }
 
 apply_patches() {
-  [ -d "$PATCH_DIR" ] || return 0
+  [ -d "$APP_PATCH_DIR" ] || return 0
   local p d sub
-  for p in "$PATCH_DIR"/*.patch; do
+  for p in "$APP_PATCH_DIR"/*.patch; do
     [ -e "$p" ] || continue
     log "Applying patch $(basename "$p")"
     git -C "$SRC" apply --whitespace=fix -v "$p"
   done
-  for d in "$PATCH_DIR"/*/; do
+  for d in "$APP_PATCH_DIR"/*/; do
     [ -d "$d" ] || continue
     sub="$(basename "$d")"
-    [ -d "$SRC/$sub" ] || die "patches/$sub/ doesn't match a folder in LoopWorkspace."
+    [ -d "$SRC/$sub" ] || die "$APP_PATCH_DIR/$sub/ doesn't match a folder in $APP_NAME."
     for p in "$d"*.patch; do
       [ -e "$p" ] || continue
       log "Applying patch $sub/$(basename "$p")"
@@ -324,7 +401,7 @@ bundle_install() {
   (cd "$SRC" && BUNDLE_PATH="$BUNDLE_DIR" bundle install --quiet)
 }
 
-# Run one of LoopKit's fastlane lanes with the environment GitHub Actions would provide.
+# Run one of the app's fastlane lanes with the environment GitHub Actions would provide.
 run_lane() {
   log "fastlane $1"
   (
@@ -350,13 +427,15 @@ run_lane() {
 # Make sure certificates and profiles exist; explain what to do if they can't be used.
 ensure_certs() {
   if run_lane certs; then return 0; fi
-  log "fastlane certs failed; checking the distribution certificate."
-  rm -f "$SRC/fastlane/new_certificate_needed.txt"
-  run_lane check_and_renew_certificates || true
-  if [ "$(cat "$SRC/fastlane/new_certificate_needed.txt" 2>/dev/null)" = "true" ]; then
-    die "Your distribution certificate is missing or expired. Run '$0 nuke-certs' interactively, then '$0 build'."
+  log "fastlane certs failed for $APP_NAME; checking the distribution certificate."
+  if [ -n "$LANE_RENEW" ]; then
+    rm -f "$SRC/fastlane/new_certificate_needed.txt"
+    run_lane "$LANE_RENEW" || true
+    if [ "$(cat "$SRC/fastlane/new_certificate_needed.txt" 2>/dev/null)" = "true" ]; then
+      die "Your distribution certificate is missing or expired. Run '$0 nuke-certs' interactively, then '$0 build'."
+    fi
   fi
-  die "fastlane certs failed. If Apple says you have too many certificates, revoke an unused distribution certificate at developer.apple.com, then run '$0 build'."
+  die "fastlane certs failed. If Apple says you have too many certificates, revoke an unused distribution certificate at developer.apple.com, then run '$0 build'. If the certificate expired, run '$0 nuke-certs'."
 }
 
 # Run git with the backup repo's credentials (MATCH_BACKUP_SSH_KEY), never prompting:
@@ -391,21 +470,26 @@ backup_match() {
 }
 
 save_artifacts() {
-  local dest
-  dest="$ARTIFACT_DIR/$(date +%Y-%m-%d_%H%M%S)"
+  local dest f
+  dest="$ARTIFACT_DIR/$APP/$(date +%Y-%m-%d_%H%M%S)"
   mkdir -p "$dest"
-  if [ -d "$SRC/artifacts" ]; then cp -R "$SRC/artifacts/." "$dest/"; fi
+  if [ -d "$SRC/artifacts" ]; then
+    cp -R "$SRC/artifacts/." "$dest/"
+  else
+    for f in "$SRC"/*.ipa "$SRC"/*.dSYM.zip; do [ -e "$f" ] && cp -R "$f" "$dest/"; done
+  fi
   if [ -e "$SRC/buildlog" ]; then cp -R "$SRC/buildlog" "$dest/"; fi
-  prune "$ARTIFACT_DIR" "$KEEP_ARTIFACTS"
+  prune "$ARTIFACT_DIR/$APP" "$KEEP_ARTIFACTS"
   log "Saved build files to $dest"
 }
 
 cmd_setup() {
-  local import_url=""
+  local import_url="" apps=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --import-match) import_url="${2:?--import-match needs a URL}"; shift 2 ;;
-      *) die "Unknown option for setup: $1" ;;
+      -*) die "Unknown option for setup: $1" ;;
+      *) apps="$apps $1"; shift ;;
     esac
   done
 
@@ -414,7 +498,7 @@ cmd_setup() {
   load_config
   check_tools
   update_tools
-  mkdir -p "$STATE_DIR" "$PATCH_DIR" "$ARTIFACT_DIR"
+  mkdir -p "$STATE_DIR" "$ARTIFACT_DIR"
 
   if [ -d "$MATCH_REPO" ]; then
     log "Local certificate repo already exists: $MATCH_REPO"
@@ -429,18 +513,32 @@ cmd_setup() {
   fi
   chmod -R go-rwx "$MATCH_REPO"
 
-  update_source
-  select_xcode
-  bundle_install
-  run_lane identifiers
-  ensure_certs
+  migrate_state
+  local a
+  apps="$(printf '%s\n' "${apps:-$APPS}" | tr -s ' ' | sed 's/^ //; s/ $//')"
+  for a in $apps; do app_def "$a"; done
+  for a in $apps; do
+    app_def "$a"
+    log "===== $APP_NAME ====="
+    mkdir -p "$APP_STATE"
+    update_source
+    select_xcode
+    bundle_install
+    run_lane "$LANE_IDS"
+    date +%s > "$APP_STATE/identifiers_done"
+    ensure_certs
+    cleanup_keychain
+  done
   backup_match || die "Certificates are ready, but the backup to MATCH_BACKUP_URL failed. Fix the URL or its access, then run '$0 backup'."
   date +%s > "$STATE_DIR/setup_complete"
-  log "Setup complete. Make the first build with: $0 build"
+  log "Setup complete for: $apps. Make the first build with: $0 build"
+  log "Each app needs an app record in App Store Connect before its first upload:"
+  for a in $apps; do app_def "$a"; log "  $APP_NAME: bundle ID $APP_BUNDLE"; done
 }
 
 cmd_build() {
-  local mode="$1"
+  local mode="$1" a rc apps failed=""
+  shift
   acquire_lock
   start_log "$mode"
   load_config
@@ -449,44 +547,76 @@ cmd_build() {
   prune "$LOG_DIR" "$KEEP_LOGS"
   [ -d "$MATCH_REPO" ] || die "No local certificate repo. Run '$0 setup' first."
   mkdir -p "$STATE_DIR"
+  migrate_state
+  apps="${*:-$APPS}"
+  for a in $apps; do app_def "$a"; done   # check every name before building anything
 
+  # Each app builds in a subshell, so one app failing doesn't stop the others.
+  for a in $apps; do
+    set +e
+    ( set -e; build_app "$mode" "$a" )
+    rc=$?
+    set -e
+    cleanup_keychain
+    if [ "$rc" -ne 0 ]; then
+      failed="$failed $a"
+      log "$a failed (exit $rc)."
+    fi
+  done
+  if [ -n "$failed" ]; then
+    FAILED_APPS="${failed# }"
+    exit 1
+  fi
+}
+
+# build_app MODE APP: update, build and upload one app (runs in a subshell).
+build_app() {
+  local mode="$1" key last_key last_epoch now age_days reason
+  app_def "$2"
+  log "===== $APP_NAME ====="
+  mkdir -p "$APP_STATE"
   update_source
-  local key last_key last_epoch now age_days reason
   key="$(state_key)"
 
   if [ "$mode" = auto ]; then
-    last_key="$(cat "$STATE_DIR/last_success_key" 2>/dev/null || true)"
-    last_epoch="$(cat "$STATE_DIR/last_success_epoch" 2>/dev/null || echo 0)"
+    last_key="$(cat "$APP_STATE/last_success_key" 2>/dev/null || true)"
+    last_epoch="$(cat "$APP_STATE/last_success_epoch" 2>/dev/null || echo 0)"
     now="$(date +%s)"
     age_days=$(( (now - last_epoch) / 86400 ))
     if [ -z "$last_key" ]; then
-      reason="no previous successful build"
+      reason="there's no previous successful build"
     elif [ "$BUILD_ON_NEW_COMMITS" = true ] && [ "$key" != "$last_key" ]; then
-      reason="LoopKit or your patches changed"
+      reason="$APP_NAME or your patches changed"
     elif [ "$age_days" -ge "$REBUILD_DAYS" ]; then
-      reason="last build was $age_days days ago"
+      reason="the last build was $age_days days ago"
     else
-      log "Nothing to do: no changes, last build $age_days days ago (rebuild after $REBUILD_DAYS)."
+      log "Nothing to do for $APP_NAME: no changes, last build $age_days days ago (rebuild after $REBUILD_DAYS)."
       exit 0
     fi
-    log "Building because $reason."
+    log "Building $APP_NAME because $reason."
   fi
 
   select_xcode
   apply_patches
   bundle_install
+  if [ ! -f "$APP_STATE/identifiers_done" ]; then
+    log "Registering $APP_NAME's identifiers with Apple (first time for this app)"
+    run_lane "$LANE_IDS"
+    date +%s > "$APP_STATE/identifiers_done"
+  fi
   ensure_certs
   # A failed backup shouldn't stop the build; report it and carry on.
-  backup_match || notify warning "Loop build: backing up the certificate repo failed. Log: $LOG_FILE"
-  run_lane build_loop
+  backup_match || notify warning "Backing up the certificate repo failed. Log: $LOG_FILE"
+  run_lane "$LANE_BUILD" \
+    || die "Building $APP_NAME failed. If this is its first build, check that App Store Connect has an app with bundle ID $APP_BUNDLE."
   save_artifacts
-  run_lane release
+  run_lane "$LANE_RELEASE"
 
-  echo "$key" > "$STATE_DIR/last_success_key"
-  date +%s > "$STATE_DIR/last_success_epoch"
-  git -C "$SRC" log -1 --format='%h %s' > "$STATE_DIR/last_success_commit"
-  log "Done. Loop was uploaded to TestFlight; it appears there after Apple finishes processing."
-  notify success "Loop build uploaded to TestFlight ($(cat "$STATE_DIR/last_success_commit"))"
+  echo "$key" > "$APP_STATE/last_success_key"
+  date +%s > "$APP_STATE/last_success_epoch"
+  git -C "$SRC" log -1 --format='%h %s' > "$APP_STATE/last_success_commit"
+  log "Done. $APP_NAME was uploaded to TestFlight; it appears there after Apple finishes processing."
+  notify success "$APP_NAME uploaded to TestFlight ($(cat "$APP_STATE/last_success_commit"))"
 }
 
 cmd_backup() {
@@ -501,7 +631,7 @@ cmd_backup() {
 
 # Report everything that still needs doing, without changing anything.
 cmd_check() {
-  local problems=0 v val app="" wf xb sdks
+  local problems=0 v val app="" wf xb sdks a needs_setup=0
   ok()   { printf '  ok    %s\n' "$*"; }
   todo() { printf '  TODO  %s\n' "$*"; problems=$((problems + 1)); }
   note() { printf '  note  %s\n' "$*"; }
@@ -583,11 +713,24 @@ cmd_check() {
   else
     todo "$TOOLS_REPO has no local-build/ folder. Clone the branch that has it: see local-build/README.md, step 2."
   fi
-  if [ -d "$PATCH_DIR" ]; then
-    ok "$(cd "$PATCH_DIR" && find . -type f -name '*.patch' | wc -l | tr -d ' ') patch(es) in $PATCH_DIR"
-  else
-    note "No patch folder at $PATCH_DIR; builds will be unmodified LoopKit code."
-  fi
+
+  echo "Apps (APPS=\"${APPS:-loop}\")"
+  for a in ${APPS:-loop}; do
+    case " $ALL_APPS " in
+      *" $a "*) ;;
+      *) todo "Unknown app '$a' in APPS. Known apps: $ALL_APPS"; continue ;;
+    esac
+    app_def "$a"
+    if [ -f "$APP_STATE/identifiers_done" ] || { [ "$a" = loop ] && [ ! -d "$APP_STATE" ] && [ -f "$STATE_DIR/setup_complete" ]; }; then
+      ok "$APP_NAME is set up (App Store Connect app with bundle ID $APP_BUNDLE)"
+    else
+      note "$APP_NAME isn't set up yet: 'setup' registers it. App Store Connect then needs an app with bundle ID $APP_BUNDLE."
+      needs_setup=1
+    fi
+    if [ -d "$APP_PATCH_DIR" ]; then
+      ok "   $(cd "$APP_PATCH_DIR" && find . -type f -name '*.patch' | wc -l | tr -d ' ') patch(es) in $APP_PATCH_DIR"
+    fi
+  done
 
   echo "Certificates"
   if [ -f "$STATE_DIR/setup_complete" ]; then ok "setup done; certificate repo at $MATCH_REPO"
@@ -606,7 +749,7 @@ cmd_check() {
     echo "$problems thing(s) to do before building."
     return 1
   fi
-  if [ -f "$STATE_DIR/setup_complete" ]; then
+  if [ -f "$STATE_DIR/setup_complete" ] && [ "$needs_setup" = 0 ]; then
     echo "Ready. Build and upload with: $0 build"
   else
     echo "Ready for setup. Run: $0 setup"
@@ -616,17 +759,28 @@ cmd_check() {
 fmt_epoch() { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M'; }
 
 cmd_status() {
+  local a e
+  APPS="${APPS:-}"
+  if [ -z "$APPS" ] && [ -f "$CONFIG" ] && is_private "$CONFIG"; then
+    APPS="$(sed -n 's/^APPS="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$CONFIG" | tail -n 1)"
+  fi
+  APPS="${APPS:-loop}"
   echo "Home:          $BASE"
-  if [ -f "$STATE_DIR/last_success_epoch" ]; then
-    echo "Last success:  $(fmt_epoch "$(cat "$STATE_DIR/last_success_epoch")")"
-    echo "Built commit:  $(cat "$STATE_DIR/last_success_commit" 2>/dev/null || echo unknown)"
-  else
-    echo "Last success:  never"
-  fi
-  if [ -d "$SRC/.git" ]; then
-    echo "Local source:  $(git -C "$SRC" log -1 --format='%h %s' 2>/dev/null)"
-    echo "Needs Xcode:   $(grep -oE '/Applications/Xcode[^/"]*\.app' "$SRC/.github/workflows/build_loop.yml" 2>/dev/null | head -n 1 || echo unknown)"
-  fi
+  for a in $APPS; do
+    app_def "$a"
+    e="$(cat "$APP_STATE/last_success_epoch" 2>/dev/null || cat "$STATE_DIR/last_success_epoch" 2>/dev/null || true)"
+    [ "$a" = loop ] || e="$(cat "$APP_STATE/last_success_epoch" 2>/dev/null || true)"
+    echo "$APP_NAME:"
+    if [ -n "$e" ]; then
+      echo "  Last success:  $(fmt_epoch "$e")  ($(cat "$APP_STATE/last_success_commit" 2>/dev/null || cat "$STATE_DIR/last_success_commit" 2>/dev/null || echo unknown))"
+    else
+      echo "  Last success:  never"
+    fi
+    if [ -d "$SRC/.git" ]; then
+      echo "  Local source:  $(git -C "$SRC" log -1 --format='%h %s' 2>/dev/null)"
+      echo "  Its Xcode:     $(grep -oE '/Applications/Xcode[^/"]*\.app' "$SRC/.github/workflows/$APP_WORKFLOW" 2>/dev/null | head -n 1 || echo unknown)"
+    fi
+  done
   echo "Cert repo:     $([ -d "$MATCH_REPO" ] && echo "$MATCH_REPO" || echo "missing (run setup)")"
   if [ -f "$STATE_DIR/last_match_backup_epoch" ]; then
     echo "Cert backup:   $(fmt_epoch "$(cat "$STATE_DIR/last_match_backup_epoch")")"
@@ -651,11 +805,21 @@ cmd_nuke_certs() {
   local answer
   read -r answer
   [ "$answer" = "NUKE" ] || die "Cancelled."
+  local a first=""
+  for a in $APPS; do first="${first:-$a}"; done
+  app_def "$first"
   update_source
   select_xcode
   bundle_install
   run_lane nuke_certs
-  run_lane certs
+  for a in $APPS; do
+    app_def "$a"
+    update_source
+    select_xcode
+    bundle_install
+    run_lane certs
+    cleanup_keychain
+  done
   backup_match || die "New certificate created, but the backup to MATCH_BACKUP_URL failed. Fix it, then run '$0 backup'."
   log "New certificate created. Run '$0 build' to build with it."
 }
@@ -666,8 +830,8 @@ usage() {
 
 case "${1:-help}" in
   setup)      shift; cmd_setup "$@" ;;
-  auto)       cmd_build auto ;;
-  build)      cmd_build build ;;
+  auto)       shift; cmd_build auto "$@" ;;
+  build)      shift; cmd_build build "$@" ;;
   status)     cmd_status ;;
   check)      cmd_check ;;
   backup)     cmd_backup ;;
