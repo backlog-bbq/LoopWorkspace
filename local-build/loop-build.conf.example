@@ -19,15 +19,19 @@ MATCH_PASSWORD="change-me"
 
 # --- Optional ---------------------------------------------------------------
 
-# Where the source comes from. Point this at a pull mirror on your own git
-# server to fetch LoopWorkspace from there instead of GitHub.
+# Where the source comes from. The default builds LoopKit's code directly, so
+# LoopKit updates are picked up without syncing a fork.
 #LOOP_REPO="https://github.com/LoopKit/LoopWorkspace.git"
 #LOOP_BRANCH="main"
 
+# Clone of your fork that holds this script and your patches (see README).
+# It is updated with "git pull --ff-only" before each build, so a patch you push
+# to the fork is built on the next scheduled run.
+TOOLS_REPO="~/loop-build-src"
+
 # Folder of patches to apply before each build. *.patch applies to LoopWorkspace,
 # <Submodule>/*.patch inside that submodule. Default: ~/loop-build/patches.
-# To use the patches kept in a clone of your loop-build repo:
-#PATCH_DIR="~/loop-build-src/local-build/patches"
+PATCH_DIR="~/loop-build-src/local-build/patches"
 
 # Back up the encrypted certificate repo (~/loop-build/match-secrets.git) to a
 # dedicated, empty, private repo on your own git server. loop-build runs

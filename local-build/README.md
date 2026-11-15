@@ -16,7 +16,17 @@ instead of GitHub's machines. Pick one.
 `loop-build.sh` runs LoopKit's own fastlane lanes on the Mac, with no GitHub Actions.
 Certificates live in an encrypted fastlane match repo on the Mac, and Apple is reached
 with an App Store Connect API key, so it works over ssh with nobody logged in.
-Fetching the source code is the only thing that contacts GitHub.
+Fetching code is the only thing that contacts GitHub.
+
+How the pieces fit:
+
+- **What gets built:** LoopKit/LoopWorkspace, straight from LoopKit, so new LoopKit
+  releases are picked up without syncing anything.
+- **Your changes:** this fork holds the script and `patches/`. The Mac keeps a clone
+  of it at `~/loop-build-src` and pulls it before each build, so a patch you push
+  here is built on the next scheduled run. Nothing on the fork's `main` is built.
+- **Certificates:** `~/loop-build/match-secrets.git` on the Mac, backed up to a
+  private repo on your local git server.
 
 ### One-time setup
 
@@ -26,20 +36,23 @@ Fetching the source code is the only thing that contacts GitHub.
    and first launch once as an admin:
    `sudo xcodebuild -license accept && sudo xcodebuild -runFirstLaunch`
    (with `DEVELOPER_DIR` set to that Xcode if it isn't the selected one).
-2. As `loopbuilder`, clone this repo and link the script into `~/loop-build`:
+2. As `loopbuilder`, clone this fork's branch and link the script into `~/loop-build`:
 
    ```sh
-   git clone -b <this-branch> <url-of-this-repo> ~/loop-build-src
+   git clone --single-branch -b claude/loop-headless-mac-dexcom-share-s4f8jv \
+     https://github.com/backlog-bbq/LoopWorkspace.git ~/loop-build-src
    mkdir -p ~/loop-build && chmod 700 ~/loop-build
    ln -s ~/loop-build-src/local-build/loop-build.sh ~/loop-build/loop-build.sh
    ```
 
    `~/loop-build` holds what the script creates (`LoopWorkspace/`, `bundle/`, `logs/`,
-   `state/`, `artifacts/`, `match-secrets.git/`); the clone holds only what you edit.
-   `git -C ~/loop-build-src pull` updates the script and patches.
+   `state/`, `artifacts/`, `match-secrets.git/`); `~/loop-build-src` holds only what
+   you edit, and its submodules are never downloaded. If you later merge this branch
+   into another one, switch the clone to it (`git -C ~/loop-build-src switch <branch>`
+   after a fetch of that branch).
 3. Copy `loop-build.conf.example` to `~/.config/loop-build/config`, fill it in, and
-   `chmod 600` it and your `.p8` key file. To use this repo's patches, set
-   `PATCH_DIR="~/loop-build-src/local-build/patches"`.
+   `chmod 600` it and your `.p8` key file. Its `TOOLS_REPO` and `PATCH_DIR` lines
+   already point at `~/loop-build-src`.
 4. `~/loop-build/loop-build.sh setup` (add `--import-match <url>` to reuse an existing
    Match-Secrets repo), then `~/loop-build/loop-build.sh build`.
 5. Install `com.loopbuild.auto.plist` (steps in the file) for a weekly check that
@@ -48,8 +61,8 @@ Fetching the source code is the only thing that contacts GitHub.
 ### Back up the certificate repo
 
 `~/loop-build/match-secrets.git` and `MATCH_PASSWORD` are the only copy of your
-distribution certificate. Set `MATCH_BACKUP_URL` in the config to a dedicated, empty,
-private repo on your own git server (Gitea, Forgejo, GitLab all work). The script then
+distribution certificate. Create a dedicated, empty, private repo on your local git
+server and set `MATCH_BACKUP_URL` in the config to it. The script then
 runs `git push --mirror` to it after `setup`, after every successful certificate check
 during a build, after `nuke-certs`, and when you run `loop-build.sh backup`. It never
 pushes anywhere else. The repo stays encrypted with `MATCH_PASSWORD`.
@@ -64,19 +77,14 @@ Because the push also runs from launchd, it can't prompt for anything:
 A failed backup stops `setup` and `nuke-certs` (so you notice), but only sends a
 `warning` notification during a scheduled build.
 
-### Optional: fetch LoopWorkspace from your own git server
-
-Create a pull mirror of `https://github.com/LoopKit/LoopWorkspace.git` on your forge
-(Gitea/Forgejo: New Migration > Git, tick "This repository will be a mirror";
-GitLab: Settings > Repository > Mirroring repositories, direction Pull) and set
-`LOOP_REPO` to it. The submodules and Swift packages still come from GitHub; mirroring
-those (about 40 repos) isn't worth the upkeep.
-
 ### Patches
 
 `loop-build.sh` applies `PATCH_DIR/*.patch` to LoopWorkspace and
 `PATCH_DIR/<Submodule>/*.patch` inside that submodule, after resetting everything a
-previous build changed. Changing a patch makes `auto` rebuild.
+previous build changed. To add, change or remove a patch, commit it to
+`local-build/patches/` in this fork and push; the next `auto` run pulls it and,
+because the patches changed, rebuilds. A patch that no longer applies to a new
+LoopKit release stops the build with the `git apply` error in the log.
 
 - `patches/LoopKit/mock-pump-heartbeat.patch` gives Loop's simulator pump
   (MockPumpManager) a 1-minute simulated BLE heartbeat, so a cloud CGM such as

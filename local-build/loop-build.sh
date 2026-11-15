@@ -28,6 +28,8 @@
 #   ~/.config/loop-build/config   Settings and secrets (chmod 600). See loop-build.conf.example.
 #   $LOOP_BUILD_HOME/patches/     Optional customizations (or set PATCH_DIR): *.patch applies to
 #                                 LoopWorkspace, <Submodule>/*.patch applies inside that submodule.
+#   TOOLS_REPO (optional)         A clone of the repo that holds this script and your patches.
+#                                 It is updated (git pull --ff-only) before each build.
 #   $LOOP_BUILD_HOME/logs/        One log per run.
 #   $LOOP_BUILD_HOME/artifacts/   IPA, dSYMs and build log of recent builds.
 #
@@ -101,6 +103,8 @@ load_config() {
   LOOP_BRANCH="${LOOP_BRANCH:-main}"
   XCODE_APP="${XCODE_APP:-}"
   PATCH_DIR="${PATCH_DIR/#\~/$HOME}"
+  TOOLS_REPO="${TOOLS_REPO:-}"
+  TOOLS_REPO="${TOOLS_REPO/#\~/$HOME}"
   REBUILD_DAYS="${REBUILD_DAYS:-30}"
   BUILD_ON_NEW_COMMITS="${BUILD_ON_NEW_COMMITS:-true}"
   KEEP_LOGS="${KEEP_LOGS:-30}"
@@ -192,6 +196,28 @@ check_tools() {
   local rv
   rv="$(ruby -e 'print RUBY_VERSION')"
   version_ge "$rv" 3.0 || die "Ruby $rv is too old for fastlane. Install Homebrew Ruby: brew install ruby"
+}
+
+# Bring the clone that holds this script and your patches up to date, so changes
+# pushed there are used by the next scheduled build. Only fast-forwards; local
+# edits or a network problem leave it as it is.
+update_tools() {
+  [ -n "$TOOLS_REPO" ] || return 0
+  [ -d "$TOOLS_REPO/.git" ] || die "TOOLS_REPO is not a git checkout: $TOOLS_REPO"
+  local before after
+  before="$(git -C "$TOOLS_REPO" rev-parse HEAD)"
+  log "Updating $TOOLS_REPO ($(git -C "$TOOLS_REPO" rev-parse --abbrev-ref HEAD))"
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$TOOLS_REPO" pull -q --ff-only; then
+    log "WARNING: Couldn't update $TOOLS_REPO (local changes, diverged branch or no network). Using it as it is."
+    return 0
+  fi
+  after="$(git -C "$TOOLS_REPO" rev-parse HEAD)"
+  [ "$before" != "$after" ] || return 0
+  log "Updated to $(git -C "$TOOLS_REPO" log -1 --format='%h %s')"
+  # This run keeps the version of the script it started with.
+  if ! git -C "$TOOLS_REPO" diff --quiet "$before" "$after" -- local-build/loop-build.sh; then
+    log "loop-build.sh itself changed; the new version is used from the next run."
+  fi
 }
 
 # Fetch the latest source and undo anything a previous build changed
@@ -349,6 +375,7 @@ cmd_setup() {
   start_log setup
   load_config
   check_tools
+  update_tools
   mkdir -p "$STATE_DIR" "$PATCH_DIR" "$ARTIFACT_DIR"
 
   if [ -d "$MATCH_REPO" ]; then
@@ -379,6 +406,7 @@ cmd_build() {
   start_log "$mode"
   load_config
   check_tools
+  update_tools
   prune "$LOG_DIR" "$KEEP_LOGS"
   [ -d "$MATCH_REPO" ] || die "No local certificate repo. Run '$0 setup' first."
   mkdir -p "$STATE_DIR"
